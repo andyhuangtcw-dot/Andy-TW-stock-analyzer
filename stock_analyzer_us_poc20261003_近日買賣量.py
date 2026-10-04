@@ -2197,11 +2197,19 @@ def store_bt_df(df):
     return df
 
 
+def release_bt_state(ss):
+    """清掉上一份回測資料與衍生的快取／壓縮檔，釋放記憶體"""
+    import gc
+    for k in ('bt_df', '_bt_memo', '_bt_csv', '_bt_csv_sig', 'live_stats', 'live_stats_sig'):
+        ss.pop(k, None)
+    gc.collect()
+
+
 def bt_memo(ss, name, params, fn):
     """回測分析結果快取（存在 session）：同一份回測資料、同樣參數只算一次，
     改任何一個選單時 Streamlit 會整頁重跑，沒有快取的話每次都要重算幾十秒。"""
     df = ss.get('bt_df')
-    sig = (id(df), len(df) if df is not None else 0)
+    sig = (ss.get('bt_ver'), id(df), len(df) if df is not None else 0)
     memo = ss.get('_bt_memo')
     if memo is None or memo.get('_sig') != sig:
         memo = {'_sig': sig}
@@ -3441,7 +3449,9 @@ def main():
         if up_sig and ss.get('bt_loaded_name') != up_sig:
             try:
                 with st.spinner(f'載入 {len(ups)} 個檔案中…'):
+                    release_bt_state(ss)
                     ss['bt_df'] = load_bt_files(ups)
+                    ss['bt_ver'] = ss.get('bt_ver', 0) + 1
                 ss['bt_loaded_name'] = up_sig
                 ss['bt_seg_label'] = ''
             except Exception as ex:  # noqa
@@ -3516,6 +3526,8 @@ def main():
                         '目前輸入框清單': parse_stocks(ss['stocks_text'])}[bt_univ]
             st.caption(f'回測股票池：{bt_univ}，共 {len(univ):,} 檔'
                        + ('（約需 11～15 分鐘；回測月數拉長時記憶體用量也會增加，建議搭配流動性門檻）' if len(univ) > 1000 else ''))
+            # 先釋放上一段回測留在 session 的資料，避免第2、3段跑的時候記憶體疊加而當掉
+            release_bt_state(ss)
             prog = st.progress(0.0, text='🔬 歷史回測執行中...')
             det = st.empty()
 
@@ -3543,6 +3555,7 @@ def main():
                          + '。常見排查：API Key 是否正確／方案每日額度／方案是否支援 historical-price-eod。')
             else:
                 ss['bt_df'] = store_bt_df(df)
+                ss['bt_ver'] = ss.get('bt_ver', 0) + 1
                 ss['bt_loaded_name'] = None
                 det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔")
 
@@ -3563,7 +3576,7 @@ def get_live_combo_stats(ss, K):
         return None
     mp = float(ss.get('an_minpx', ANALYSIS_DEFAULTS['min_px']))
     wq = WINSOR_OPTIONS.get(ss.get('an_wins'), ANALYSIS_DEFAULTS['wq'])
-    sig = (id(df), len(df), mp, wq)
+    sig = (ss.get('bt_ver'), id(df), len(df), mp, wq)
     if ss.get('live_stats_sig') != sig:
         combos = K['STOCK_PICK_COMBOS'] + K['PINNED_COMBOS'] + K['MOONSHOT_COMBOS']
         dw, draw, _, _ = prep_analysis_df(add_derived(df), mp, wq)
@@ -3952,13 +3965,13 @@ def render_backtest(st, ss, K):
         st.warning(f'⚠️ 資料量 {len(df_all):,} 筆偏大，Streamlit Cloud（記憶體約1GB）可能跑不動而當掉。'
                    '可以先只載入其中兩段，或回測時提高流動性門檻／最低股價減少筆數。')
     # 原始紀錄檔按了才產生（全美股約20萬筆，每次重跑都先壓一次檔會多花十幾秒和幾百MB記憶體）
-    if ss.get('_bt_csv_sig') == id(ss.get('bt_df')) and ss.get('_bt_csv'):
+    if ss.get('_bt_csv_sig') == ss.get('bt_ver') and ss.get('_bt_csv'):
         st.download_button('💾 下載回測原始紀錄（.csv.gz，之後可直接載入，不用重抓）', ss['_bt_csv'],
                            file_name=f'美股回測原始紀錄{("_" + ss["bt_seg_label"]) if ss.get("bt_seg_label") else ""}_{dt.date.today()}.csv.gz', key='dl_btcsv')
     elif st.button('💾 產生回測原始紀錄檔（之後可直接載入，不用重抓）', key='mk_btcsv'):
         with st.spinner('壓縮中…'):
             ss['_bt_csv'] = bt_csv_gz(df_all)
-            ss['_bt_csv_sig'] = id(ss.get('bt_df'))
+            ss['_bt_csv_sig'] = ss.get('bt_ver')
         st.rerun()
 
     st.markdown('##### ⚙️ 分析篩選（套用到下面所有統計；改了不用重抓資料）')

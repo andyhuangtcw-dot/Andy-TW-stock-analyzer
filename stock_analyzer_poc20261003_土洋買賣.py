@@ -29,6 +29,7 @@
 #  每日自動追蹤命中組合（排程用，不開介面）：
 #      python stock_analyzer_poc.py daily --list top100 --token 你的FinMindToken
 # ════════════════════════════════════════════════════════════════════
+import gc
 import math
 import re
 import json
@@ -2142,11 +2143,18 @@ def store_bt_df(df):
     return df
 
 
+def release_bt_state(ss):
+    """清掉上一份回測資料與衍生的快取／壓縮檔，釋放記憶體"""
+    for k in ('bt_df', '_bt_memo', '_bt_csv', '_bt_csv_sig', 'live_stats', 'live_stats_sig'):
+        ss.pop(k, None)
+    gc.collect()
+
+
 def bt_memo(ss, name, params, fn):
     """回測分析結果快取（存在 session）：同一份回測資料、同樣參數只算一次，
     改任何一個選單時 Streamlit 會整頁重跑，沒有快取的話每次都要重算幾十秒。"""
     df = ss.get('bt_df')
-    sig = (id(df), len(df) if df is not None else 0)
+    sig = (ss.get('bt_ver'), id(df), len(df) if df is not None else 0)
     memo = ss.get('_bt_memo')
     if memo is None or memo.get('_sig') != sig:
         memo = {'_sig': sig}
@@ -2202,7 +2210,8 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     inst_days = (months_back + off) * 30 + 100
     win_start = _ds(dt.date.today() - dt.timedelta(days=(months_back + off) * 30))
     win_end = _ds(dt.date.today() - dt.timedelta(days=off * 30)) if off else None
-    records = []
+    fail_reasons = {}
+    frames = []   # 每檔算完就轉成 float32 DataFrame（整段回測若用 list of dict 暫存，十幾萬筆會吃掉近 1GB 記憶體）
     saved = failed = 0
     total = len(universe)
     for i, sid in enumerate(universe):
@@ -2217,6 +2226,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
             ev_end = n - maxh
             if ev_end <= buf:
                 failed += 1
+                fail_reasons['股價資料天數不足'] = fail_reasons.get('股價資料天數不足', 0) + 1
                 continue
             rev, pxm, inst, trust, foreign = {}, {}, {}, {}, {}
             if include_div:
@@ -2232,6 +2242,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                     inst, trust, foreign = {}, {}, {}
             pc = PatternCache(b)
             nm = name_map.get(sid, sid)
+            recs = []
             for e in range(buf, ev_end):
                 ds = b.date[e]
                 if ds < win_start or (win_end and ds >= win_end):
@@ -2248,28 +2259,40 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                     ex['inst3m'] = inst3m_asof(inst, ds)
                     ex.update(inst_flow_asof(inst, trust, foreign, b.date, e))
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
-                row['stockId'] = sid
-                row['name'] = nm
                 ec = b.close[e]
                 row['entryClose'] = ec
                 for h in HORIZONS:
                     row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
-                records.append(row)
-                saved += 1
-        except Exception:  # noqa
+                recs.append(row)
+            if recs:
+                d = pd.DataFrame(recs)
+                del recs
+                for c in d.columns:
+                    if c != 'evalDate':
+                        d[c] = pd.to_numeric(d[c], errors='coerce').astype('float32')
+                d.insert(1, 'stockId', sid)
+                d.insert(2, 'name', nm)
+                frames.append(d)
+                saved += len(d)
+            del b, pc
+        except Exception as ex:  # noqa
             failed += 1
+            k = str(ex)[:120] or type(ex).__name__
+            fail_reasons[k] = fail_reasons.get(k, 0) + 1
         if i < total - 1 and delay:
             time.sleep(delay)
     if on_progress:
         on_progress(total, total, saved, failed, None)
-    df = pd.DataFrame(records)
+    df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    del frames
     if len(df):
         front = ['evalDate', 'stockId', 'name']
         df = df[front + [c for c in df.columns if c not in front]]
         for c in df.columns:
-            if c not in ('evalDate', 'stockId', 'name'):
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-    return df, dict(saved=saved, failed=failed, total=total)
+            if c not in ('evalDate', 'stockId', 'name') and df[c].dtype != np.float32:
+                df[c] = pd.to_numeric(df[c], errors='coerce').astype('float32')
+    top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:3]
+    return df, dict(saved=saved, failed=failed, total=total, top_fail=[f'{k}（{v}檔）' for k, v in top])
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -3242,7 +3265,9 @@ def main():
         if up_sig and ss.get('bt_loaded_name') != up_sig:
             try:
                 with st.spinner(f'載入 {len(ups)} 個檔案中…'):
+                    release_bt_state(ss)
                     ss['bt_df'] = load_bt_files(ups)
+                    ss['bt_ver'] = ss.get('bt_ver', 0) + 1
                 ss['bt_loaded_name'] = up_sig
                 ss['bt_seg_label'] = ''
             except Exception as ex:  # noqa
@@ -3301,6 +3326,9 @@ def main():
             univ = {'上市清單': K['TWSE_LIST'], '上櫃清單': K['TPEX_LIST'],
                     '上市+上櫃': K['TWSE_LIST'] + K['TPEX_LIST'],
                     '目前輸入框清單': parse_stocks(ss['stocks_text'])}[bt_univ]
+            # 先釋放上一段回測留在 session 的資料（原始紀錄、壓縮檔、分析快取），
+            # 否則第2、3段跑的時候舊資料還佔著記憶體，Streamlit Cloud（約1GB）容易直接當掉
+            release_bt_state(ss)
             prog = st.progress(0.0, text='🔬 歷史回測執行中...')
             det = st.empty()
 
@@ -3313,8 +3341,14 @@ def main():
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             ss['bt_df'] = store_bt_df(df)
+            ss['bt_ver'] = ss.get('bt_ver', 0) + 1
             ss['bt_loaded_name'] = None
             det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔")
+            if not len(df):
+                st.error('❌ 這次回測沒有產生任何評估紀錄。失敗原因：' + ('；'.join(stt.get('top_fail') or []) or '不明')
+                         + '。常見原因：FinMind 每小時請求額度用完（請過一小時再跑，或把「回測每檔間隔秒數」調高）、Token 錯誤。')
+            elif stt['failed'] > max(20, stt['total'] * 0.2):
+                st.warning(f"⚠️ 有 {stt['failed']} 檔失敗（共 {stt['total']} 檔），結果可能不完整。主要原因：" + '；'.join(stt.get('top_fail') or []))
 
     tab_batch, tab_track, tab_bt = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測'])
     with tab_batch:
@@ -3331,7 +3365,7 @@ def get_live_combo_stats(ss, K):
     df = ss.get('bt_df')
     if df is None or not len(df):
         return None
-    sig = (id(df), len(df))
+    sig = (ss.get('bt_ver'), id(df), len(df))
     if ss.get('live_stats_sig') != sig:
         combos = K['STOCK_PICK_COMBOS'] + K['PINNED_COMBOS'] + K['MOONSHOT_COMBOS']
         ss['live_stats'] = compute_live_combo_stats(add_derived(df), combos)
@@ -3662,13 +3696,13 @@ def render_backtest(st, ss, K):
         st.warning(f'⚠️ 資料量 {len(df):,} 筆偏大，Streamlit Cloud（記憶體約1GB）可能跑不動而當掉。'
                    '可以先只載入其中兩段，或回測時提高流動性門檻／最低股價減少筆數。')
     # 原始紀錄檔按了才產生（全美股約20萬筆，每次重跑都先壓一次檔會多花十幾秒和幾百MB記憶體）
-    if ss.get('_bt_csv_sig') == id(ss.get('bt_df')) and ss.get('_bt_csv'):
+    if ss.get('_bt_csv_sig') == ss.get('bt_ver') and ss.get('_bt_csv'):
         st.download_button('💾 下載回測原始紀錄（.csv.gz，之後可直接載入，不用重抓）', ss['_bt_csv'],
                            file_name=f'回測原始紀錄{("_" + ss["bt_seg_label"]) if ss.get("bt_seg_label") else ""}_{dt.date.today()}.csv.gz', key='dl_btcsv')
     elif st.button('💾 產生回測原始紀錄檔（之後可直接載入，不用重抓）', key='mk_btcsv'):
         with st.spinner('壓縮中…'):
             ss['_bt_csv'] = bt_csv_gz(df)
-            ss['_bt_csv_sig'] = id(ss.get('bt_df'))
+            ss['_bt_csv_sig'] = ss.get('bt_ver')
         st.rerun()
 
     def show(title, t, note=None):
