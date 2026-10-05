@@ -2173,16 +2173,51 @@ def merge_realtime_quote(rows, q):
                         volume=vol if math.isfinite(vol) else 0)], True
 
 
+UNIVERSE_MIN_PRICE = 10.0        # 全美股股票池：股價 ≥10 美元
+UNIVERSE_MIN_DOLLAR_VOL = 1e7     # 成交金額（股價×成交量）≥1000 萬美元
+UNIVERSE_MAX = 2000               # 依成交金額由大到小取前 2000 檔
+
+
+def filter_universe_rows(rows, min_price=UNIVERSE_MIN_PRICE, min_dv=UNIVERSE_MIN_DOLLAR_VOL, cap=UNIVERSE_MAX):
+    """company-screener 結果 → 排除股價 <10、成交金額 <1000萬美元，依成交金額排序取前 cap 檔"""
+    out = []
+    for r in rows or []:
+        sym = r.get('symbol')
+        if not sym:
+            continue
+        try:
+            px = float(r.get('price') or 0)
+        except Exception:  # noqa
+            px = 0.0
+        try:
+            vol = float(r.get('volume') or 0)
+        except Exception:  # noqa
+            vol = 0.0
+        if px and px < min_price:
+            continue
+        dv = px * vol
+        if px and vol and dv < min_dv:
+            continue
+        out.append((dv, sym, r.get('companyName') or sym))
+    out.sort(key=lambda x: -x[0])
+    return [dict(id=sym, name=nm) for _, sym, nm in out[:cap]]
+
+
 def fetch_market_universe(token):
+    # volumeMoreThan 只是粗篩（高價股成交股數少也可能成交金額很大），真正門檻用 股價×成交量 ≥1000萬美元
     j = fmp_get('/company-screener', dict(exchange='NYSE,NASDAQ', country='US', isEtf='false', isFund='false',
-                                          isActivelyTrading='true', volumeMoreThan=50000, limit=3000), token, timeout=60)
+                                          isActivelyTrading='true', priceMoreThan=int(UNIVERSE_MIN_PRICE),
+                                          volumeMoreThan=5000, limit=6000), token, timeout=60)
     if not isinstance(j, list) or not j:
         raise RuntimeError('company-screener 回傳空清單，請確認 API Key 是否有效')
-    return [dict(id=r['symbol'], name=r.get('companyName') or r['symbol']) for r in j if r.get('symbol')]
+    out = filter_universe_rows(j)
+    if not out:
+        raise RuntimeError('company-screener 篩選後沒有股票（股價≥10、成交金額≥1000萬美元）')
+    return out
 
 
 def fetch_market_snapshot(token, progress=None):
-    """全市場（NYSE+NASDAQ，約3000檔）逐檔查 /quote，平行查詢＋限流；回傳 [{id,name,pct,volume}]"""
+    """全市場（NYSE+NASDAQ，約2000檔）逐檔查 /quote，平行查詢＋限流；回傳 [{id,name,pct,volume}]"""
     uni = fetch_market_universe(token)
     names = {u['id']: u['name'] for u in uni}
     out, done = [], [0]
@@ -2447,10 +2482,10 @@ BT_SEG_MONTHS = 6   # 三年分六段：每段半年（全美股一年一段容�
 BT_SEG_OPTIONS = ['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
 
 WINSOR_OPTIONS = {'截尾 1%／99%（建議）': 0.01, '截尾 0.5%／99.5%': 0.005, '不處理': 0.0}
-ANALYSIS_DEFAULTS = dict(min_px=5.0, wq=0.01)
+ANALYSIS_DEFAULTS = dict(min_px=10.0, wq=0.01)
 
 
-def prep_analysis_df(df, min_px=5.0, wq=0.01):
+def prep_analysis_df(df, min_px=10.0, wq=0.01):
     """全美股資料含大量小型股：先濾掉低價股，再把 5/10/20 日報酬截尾（winsorize），
     避免少數暴漲暴跌（雞蛋水餃股、反向分割資料錯誤）把平均報酬／t值拉歪。
     回傳 (截尾後df, 未截尾df［飆股搜尋用］, {h: (下限, 上限)}, 被濾掉的筆數)"""
@@ -2475,7 +2510,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
                  stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
-    universe 可以是全美股約3000檔（fetch_market_universe），時間主要花在 API：3000檔約需 11～15 分鐘。"""
+    universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
     buf = 60
     maxh = max(HORIZONS)
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
@@ -3438,7 +3473,7 @@ DAILY_USAGE = """每日追蹤（命令列）：
                                         [--token XXX] [--days 180] [--no-extras] [--out 資料夾]
   token 也可用環境變數 FMP_API_KEY。流程：抓清單 → 批次分析 → 命中組合累加到 combo_hits_log_us.csv
   → 更新所有追蹤股票的報酬 → 輸出「美股命中組合_日期.xlsx」（今日命中／追蹤明細／組合彙總）。
-  top100＝全市場約3000檔逐檔查報價後取漲幅前100＋成交量前100（限流280次/分，約需10多分鐘）。
+  top100＝全市場約2000檔逐檔查報價後取漲幅前100＋成交量前100（限流280次/分，約需7～10分鐘）。
   建議排程在美股收盤後（台灣時間早上 6:00 之後）執行。"""
 
 
@@ -3548,7 +3583,7 @@ def main():
             src = ss['lists'].get(k, [])
         ss['stocks_text'] = '\n'.join(src)
 
-    # ── 漲幅／成交量前100（全市場約3000檔逐檔查報價）：在畫出輸入框前先把清單換掉 ──
+    # ── 漲幅／成交量前100（全市場約2000檔逐檔查報價）：在畫出輸入框前先把清單換掉 ──
     pending = ss.pop('pending_top100', None)
     if pending:
         tok = ss.get('token', '').strip()
@@ -3604,10 +3639,10 @@ def main():
         st.checkbox('📌 批次分析後自動把命中組合股票加入追蹤', value=True, key='auto_track')
         run_batch = st.button('🔍 批次分析', type='primary', use_container_width=True, key='run_batch')
         cg, cv = st.columns(2)
-        if cg.button('🔥 漲幅前100', use_container_width=True, help='全市場約3000檔逐檔查報價，約需10多分鐘'):
+        if cg.button('🔥 漲幅前100', use_container_width=True, help='全市場約2000檔逐檔查報價，約需7～10分鐘'):
             ss['pending_top100'] = 'gain'
             st.rerun()
-        if cv.button('📊 成交量前100', use_container_width=True, help='全市場約3000檔逐檔查報價，約需10多分鐘'):
+        if cv.button('📊 成交量前100', use_container_width=True, help='全市場約2000檔逐檔查報價，約需7～10分鐘'):
             ss['pending_top100'] = 'vol'
             st.rerun()
         if ss['msg']:
@@ -3625,9 +3660,9 @@ def main():
             st.caption('⚠️ 美股回測中分價量表訊號單獨都沒有超額報酬，僅供參考，不當組合搜尋條件。')
 
         st.divider()
-        st.markdown('**🔬 歷史回測分析（美股，預設全美股約3000檔）**')
-        bt_univ = st.selectbox('回測股票池', ['全美股（約3000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
-                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，日均量>5萬股），約3000檔')
+        st.markdown('**🔬 歷史回測分析（美股，預設全美股約2000檔）**')
+        bt_univ = st.selectbox('回測股票池', ['全美股（約2000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
+                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，股價≥10美元、成交金額≥1000萬美元，依成交金額取前2000檔）')
         bt_workers = st.number_input('回測平行抓取數', 1, 32, 8, 1, key='bt_workers', help='同時抓幾檔；總請求數仍受每分鐘上限控制')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
                               help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析')
@@ -3642,10 +3677,10 @@ def main():
         bt_sector = st.checkbox('🏭 類股狀態濾網（每檔多一次 sector 查詢）', key='bt_sector')
         bt_earn = st.checkbox('📊 財報驚喜／財報跳空（每檔多一次 earnings 查詢）', True, key='bt_earn',
                               help='美股最穩定的異常之一：財報 EPS 優於預期、財報日向上跳空的股票，之後1～3個月常持續走強（PEAD）')
-        bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 5.0, 1.0, key='bt_minpx',
+        bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
-        bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 500, 100, key='bt_liq',
-                                 help='全美股建議 500 萬美元以上，排除成交清淡的小型股')
+        bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
+                                 help='全美股預設 1000 萬美元：近20日平均成交金額低於此值的評估點不收')
         bt_delay = st.number_input('回測每檔間隔秒數（已有限流器）', 0.0, 5.0, 0.0, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
         st.caption('營收YoY用季報，公告延遲以季末+45天估計（非精確申報日）；美股沒有三大法人資料。')
