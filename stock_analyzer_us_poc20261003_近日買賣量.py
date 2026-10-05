@@ -2430,6 +2430,14 @@ def release_bt_state(ss):
     gc.collect()
 
 
+def bt_memo_ready(ss, name, params):
+    """這組參數是否已經算過（不觸發計算）"""
+    df = ss.get('bt_df')
+    sig = (ss.get('bt_ver'), id(df), len(df) if df is not None else 0)
+    memo = ss.get('_bt_memo')
+    return bool(memo) and memo.get('_sig') == sig and ((name,) + tuple(params)) in memo
+
+
 def bt_memo(ss, name, params, fn):
     """回測分析結果快取（存在 session）：同一份回測資料、同樣參數只算一次，
     改任何一個選單時 Streamlit 會整頁重跑，沒有快取的話每次都要重算幾十秒。"""
@@ -4292,28 +4300,31 @@ def render_backtest(st, ss, K):
     cmt = c5.number_input('t值門檻', -10.0, 20.0, 1.0, 0.5, key='cmt',
                           help='排除 t值(同日調整) 低於門檻的組合（t<1：扣掉同一天大盤後幾乎沒有超額報酬，勝率多半只是跟著大盤）')
     cred = c6.checkbox('排除冗餘組合', True, key='cred', help='多加一個條件後樣本完全沒變（例如「母子懷抱剛形成」必然也是「型態剛形成」），這種組合不重複列出')
-    with st.spinner('多因子複選搜尋計算中…'):
-        res, tested, base = bt_memo(ss, 'combo', fk + (ch, int(cms), float(cwr), cred, csort),
-                                    lambda: combo_search(df, ch, 3, int(cms), float(cwr), cred, 't' if csort.startswith('t') else 'win'))
-    n_before_t = len(res)
-    if len(res) and 't值(同日調整)' in res.columns:
-        res = res[res['t值(同日調整)'] >= float(cmt)].reset_index(drop=True)
-    cboth = st.checkbox('只列各段 t值都 ≥ 2 的組合（✅ 各段一致）', False, key='cboth',
-                        help='回測期間依評估日切段（資料超過18個月切三段，否則前後兩半），各段各自算同日調整 t 值。'
-                             '每段都 ≥2 代表不是單一段行情造成的巧合，最值得相信')
-    if cboth and len(res) and '各段一致' in res.columns:
-        res = res[res['各段一致'] == '✅'].reset_index(drop=True)
-    if len(res):
-        res.insert(1, '類型', res['條件組合'].map(lambda s: combo_type_label([x.strip() for x in s.split('＋')])))
-    if base:
-        st.caption(f"全體基準（{ch}日）：樣本 {base['n']:,}　平均報酬 {base['avg']:.2f}%　勝率 {base['win']:.1f}%　中位數 {base['median']:.2f}%　"
-                   f"｜共測試 {tested:,} 種組合，勝率≥{cwr:.0f}% 的 {n_before_t:,} 組，再排除 t值<{cmt:g} 後剩 {len(res):,} 組"
-                   + (f"｜{base['parts']}（✅＝每段 t 都 ≥2，⚠️k/n＝n段中有k段達標）。" if base.get('parts') else '。')
-                   + '⚠️ 測試組合越多，純運氣突出的也越多。「同日超額報酬」＝每筆報酬扣掉同一天全部紀錄的平均，t值也用它算，已排除大盤齊漲齊跌；t>2 較可信。')
-    st.dataframe(res, hide_index=True, use_container_width=True, height=420)
-    if len(res):
-        st.download_button('📥 匯出 Excel', df_to_excel_bytes(res, '多因子複選搜尋'),
-                           file_name=f'多因子複選搜尋_勝率{cwr:.0f}%以上_t{cmt:g}以上_{dt.date.today()}.xlsx', key='dl_combo')
+    if not bt_memo_ready(ss, 'combo', fk + (ch, int(cms), float(cwr), cred, csort)) and not st.button('🧩 開始多因子搜尋', key='run_combo', type='primary'):
+        st.info(f'回測資料共 {len(df):,} 筆；多因子搜尋需要 1～3 分鐘、也比較吃記憶體，按上方按鈕才開始計算（同一組參數算過一次就會記住，改參數要再按一次）。')
+    else:
+        with st.spinner('多因子複選搜尋計算中…'):
+            res, tested, base = bt_memo(ss, 'combo', fk + (ch, int(cms), float(cwr), cred, csort),
+                                        lambda: combo_search(df, ch, 3, int(cms), float(cwr), cred, 't' if csort.startswith('t') else 'win'))
+        n_before_t = len(res)
+        if len(res) and 't值(同日調整)' in res.columns:
+            res = res[res['t值(同日調整)'] >= float(cmt)].reset_index(drop=True)
+        cboth = st.checkbox('只列各段 t值都 ≥ 2 的組合（✅ 各段一致）', False, key='cboth',
+                            help='回測期間依評估日切段（資料超過18個月切三段，否則前後兩半），各段各自算同日調整 t 值。'
+                                 '每段都 ≥2 代表不是單一段行情造成的巧合，最值得相信')
+        if cboth and len(res) and '各段一致' in res.columns:
+            res = res[res['各段一致'] == '✅'].reset_index(drop=True)
+        if len(res):
+            res.insert(1, '類型', res['條件組合'].map(lambda s: combo_type_label([x.strip() for x in s.split('＋')])))
+        if base:
+            st.caption(f"全體基準（{ch}日）：樣本 {base['n']:,}　平均報酬 {base['avg']:.2f}%　勝率 {base['win']:.1f}%　中位數 {base['median']:.2f}%　"
+                       f"｜共測試 {tested:,} 種組合，勝率≥{cwr:.0f}% 的 {n_before_t:,} 組，再排除 t值<{cmt:g} 後剩 {len(res):,} 組"
+                       + (f"｜{base['parts']}（✅＝每段 t 都 ≥2，⚠️k/n＝n段中有k段達標）。" if base.get('parts') else '。')
+                       + '⚠️ 測試組合越多，純運氣突出的也越多。「同日超額報酬」＝每筆報酬扣掉同一天全部紀錄的平均，t值也用它算，已排除大盤齊漲齊跌；t>2 較可信。')
+        st.dataframe(res, hide_index=True, use_container_width=True, height=420)
+        if len(res):
+            st.download_button('📥 匯出 Excel', df_to_excel_bytes(res, '多因子複選搜尋'),
+                               file_name=f'多因子複選搜尋_勝率{cwr:.0f}%以上_t{cmt:g}以上_{dt.date.today()}.xlsx', key='dl_combo')
 
 
     # ── 飆股搜尋 ──
@@ -4324,18 +4335,21 @@ def render_backtest(st, ss, K):
     mpct = d3.number_input('飆股比例門檻(%)', 0.0, 100.0, 10.0, 1.0, key='mpct')
     mms = d4.number_input('最少樣本數', 5, 5000, 20, 5, key='mms')
     mred = d5.checkbox('排除冗餘組合', True, key='mred')
-    with st.spinner('飆股搜尋計算中…'):
-        mres, mtested, mbase = bt_memo(ss, 'moon', fk + (mh, float(mthr), int(mms), float(mpct), mred),
-                                       lambda: moonshot_search(df_raw, mh, float(mthr), 3, int(mms), float(mpct), mred))
-    if mbase:
-        st.caption(f"全體基準（{mh}日漲幅>{mthr:.0f}%）：{mbase['n']:,} 筆中 {mbase['moonN']:,} 次飆股，"
-                   f"基準飆股比例 {mbase['pct']:.2f}%　｜共測試 {mtested:,} 種組合，達標 {len(mres):,} 組"
-                   + (f"｜{mbase['parts']}，每段飆股比例都高才可信。" if mbase.get('parts') else '。')
-                   + '「倍數」＝組合飆股比例÷基準；飆股是稀有事件，飆股次數只有個位數的不建議當真。')
-    st.dataframe(mres, hide_index=True, use_container_width=True, height=420)
-    if len(mres):
-        st.download_button('📥 匯出 Excel', df_to_excel_bytes(mres, '飆股搜尋'),
-                           file_name=f'飆股搜尋_比例{mpct:.0f}%以上_{dt.date.today()}.xlsx', key='dl_moon')
+    if not bt_memo_ready(ss, 'moon', fk + (mh, float(mthr), int(mms), float(mpct), mred)) and not st.button('🚀 開始飆股搜尋', key='run_moon', type='primary'):
+        st.info(f'回測資料共 {len(df):,} 筆；飆股搜尋需要 1～3 分鐘、也比較吃記憶體，按上方按鈕才開始計算（同一組參數算過一次就會記住，改參數要再按一次）。')
+    else:
+        with st.spinner('飆股搜尋計算中…'):
+            mres, mtested, mbase = bt_memo(ss, 'moon', fk + (mh, float(mthr), int(mms), float(mpct), mred),
+                                           lambda: moonshot_search(df_raw, mh, float(mthr), 3, int(mms), float(mpct), mred))
+        if mbase:
+            st.caption(f"全體基準（{mh}日漲幅>{mthr:.0f}%）：{mbase['n']:,} 筆中 {mbase['moonN']:,} 次飆股，"
+                       f"基準飆股比例 {mbase['pct']:.2f}%　｜共測試 {mtested:,} 種組合，達標 {len(mres):,} 組"
+                       + (f"｜{mbase['parts']}，每段飆股比例都高才可信。" if mbase.get('parts') else '。')
+                       + '「倍數」＝組合飆股比例÷基準；飆股是稀有事件，飆股次數只有個位數的不建議當真。')
+        st.dataframe(mres, hide_index=True, use_container_width=True, height=420)
+        if len(mres):
+            st.download_button('📥 匯出 Excel', df_to_excel_bytes(mres, '飆股搜尋'),
+                               file_name=f'飆股搜尋_比例{mpct:.0f}%以上_{dt.date.today()}.xlsx', key='dl_moon')
 
 
 
