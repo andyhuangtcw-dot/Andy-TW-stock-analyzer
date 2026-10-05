@@ -1076,7 +1076,8 @@ def tech_extras(b, e):
     3日內突破季線／半年線、連續放量、MACD零軸下金叉。資料不足時為 None"""
     out = dict(high52Dist=None, newHigh52=None, maBull=None, bbwRank=None, gapUp3=None,
                crossMa60_3=None, crossMa100_3=None, vol3Ratio=None, gcBelow0_3=None,
-               udVolRatio20=None, cmf20=None, obvNewHigh60=None)
+               udVolRatio20=None, cmf20=None, obvNewHigh60=None,
+               bias20=None, pullMa60=None, limitUp3=None, drop5=None, nr7=None)
     if e < 0 or e >= b.n:
         return out
     if e >= 249:
@@ -1140,6 +1141,19 @@ def tech_extras(b, e):
             mx = max(mx, obv)
         obv += b.volume[e] if b.close[e] > b.close[e - 1] else (-b.volume[e] if b.close[e] < b.close[e - 1] else 0.0)
         out['obvNewHigh60'] = int(obv > mx)
+    # 2026-10-05 新增：短線乖離、多頭回測季線、近3日漲停（台股）、近5日跌幅與NR7窄幅日（美股）
+    out.update(dict(bias20=None, pullMa60=None, limitUp3=None, drop5=None, nr7=None))
+    if b.ma20[e]:
+        out['bias20'] = (b.close[e] / b.ma20[e] - 1) * 100
+    if e >= 10 and b.ma60[e] and b.ma60[e - 10]:
+        out['pullMa60'] = int(b.ma60[e] > b.ma60[e - 10] and abs(b.close[e] / b.ma60[e] - 1) <= 0.03)
+    if e >= 3:
+        out['limitUp3'] = int(any(b.close[j - 1] > 0 and b.close[j] / b.close[j - 1] - 1 >= 0.095 for j in range(e - 2, e + 1)))
+    if e >= 5 and b.close[e - 5]:
+        out['drop5'] = (b.close[e] / b.close[e - 5] - 1) * 100
+    if e >= 6:
+        rg = [b.high[j] - b.low[j] for j in range(e - 6, e + 1)]
+        out['nr7'] = int(rg[-1] < min(rg[:-1]))
     return out
 
 
@@ -1244,10 +1258,18 @@ NEW_TECH_FLAGS = [
     ('udVolRatio20', '漲時量≥跌時量1.5倍(近20日)', lambda s: s.ge(1.5)),
     ('cmf20', 'CMF資金流買方佔優(近20日≥0.1)', lambda s: s.ge(0.1)),
     ('obvNewHigh60', 'OBV能量潮創60日新高', lambda s: s.eq(1)),
+    # 2026-10-05 新增（待回測驗證）
+    ('pullMa60', '多頭回測季線(季線上揚、距季線±3%)', lambda s: s.eq(1)),
+    ('bias20', '短線過熱(高於月線≥20%)', lambda s: s.ge(20)),
+    ('drop5', '近5日跌幅≥8%(短線超跌)', lambda s: s.le(-8)),
+    ('nr7', 'NR7窄幅日(近7日振幅最小)', lambda s: s.eq(1)),
 ]
 # 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
 SEARCH_EXCLUDE_FLAGS = {'型態成形中', '型態突破確認', '型態剛形成(剛突破)', '突破上升軌道線剛形成',
                         '分價量表-守穩POC買進', '分價量表-突破POC追價買進', '分價量表-反彈POC遇壓賣出', '分價量表-破位停損賣出'}
+# 2026-10-05 美股三年三段回測稽核：下列條件單獨無效（或只在單一行情有效），且幾乎不出現在三段都穩定的選股／飆股組合，
+# 不再放進搜尋以減少雜訊與運算量（指定組合比對、追蹤統計、單一條件表仍保留）
+SEARCH_EXCLUDE_FLAGS |= {'跌深反彈盤', '頭肩底剛形成', '複式頭肩底剛形成', '一字底(均線糾結)剛形成', '三重底剛形成', '圓弧底剛形成', '地量(≤0.5倍均量)', '量能區間低檔(≤10百分位)', '突破飆股大量黑K最高點剛形成', 'K線橫盤的突破剛形成', '突破ABC修正下降切線剛形成', 'N字底剛形成'}
 
 
 def search_flags(df):
@@ -1311,6 +1333,7 @@ def build_condition_flags(df: pd.DataFrame):
     if has('relStrength20'):
         F['相對強弱為正(強於大盤)'] = df['relStrength20'].gt(0)
         F['相對強弱為負(弱於大盤)'] = df['relStrength20'].lt(0)
+        F['近20日強於大盤≥10%'] = df['relStrength20'].ge(10)
     if has('volRatio'):
         F['爆量(≥1.5倍均量)'] = df['volRatio'].ge(1.5)
         F['爆量(≥2倍均量)'] = df['volRatio'].ge(2)
