@@ -2296,10 +2296,60 @@ def divergence_asof_us(rev, pxq, asof):
 # ════════════════════════════════════════════════════════════════════
 #  歷史回測
 # ════════════════════════════════════════════════════════════════════
-def add_derived(df):
+# ── 回測記憶體：每檔結果轉成「欄位→numpy 陣列」，最後逐欄合併（合併完一欄就釋放該欄），
+# 記憶體高峰約只有最終資料的 1 倍，不會像 pd.concat＋排序＋複製那樣疊到 3 倍 ──
+DEAD_BT_COLS = ('crossMa60_3', 'crossMa100_3', 'gcBelow0_3')   # 已確認無效、旗標已移除的欄位，不再存進回測紀錄
+
+
+def frame_arrays(d):
+    return {c: d[c].to_numpy(copy=True) for c in d.columns if c not in DEAD_BT_COLS}
+
+
+def low_mem_concat(frames, sort=True):
+    """frames：list of {欄位: 陣列}；依 evalDate、stockId 排序後組成 DataFrame（數值欄一律 float32）"""
+    frames = [f for f in frames if f and len(next(iter(f.values()))) > 0]
+    if not frames:
+        return pd.DataFrame()
+    cols = []
+    seen = set()
+    for f in frames:
+        for c in f:
+            if c not in seen:
+                seen.add(c)
+                cols.append(c)
+    front = [c for c in ('evalDate', 'stockId', 'name') if c in seen]
+    cols = front + [c for c in cols if c not in front]
+    order = None
+    if sort and 'evalDate' in seen and 'stockId' in seen:
+        ed = np.concatenate([np.asarray(f['evalDate']).astype(str) for f in frames])
+        sid = np.concatenate([np.asarray(f['stockId']).astype(str) for f in frames])
+        order = np.lexsort((sid, ed))
+        del ed, sid
+    lens = [len(next(iter(f.values()))) for f in frames]
+    out = {}
+    for c in cols:
+        parts = []
+        for f, n in zip(frames, lens):
+            v = f.pop(c, None)
+            if v is None:
+                v = np.full(n, np.nan, dtype=np.float32) if c not in front else np.array([''] * n, dtype=object)
+            parts.append(v)
+        arr = np.concatenate(parts)
+        del parts
+        if order is not None:
+            arr = arr[order]
+        if c not in front:
+            arr = pd.to_numeric(pd.Series(arr), errors='coerce').to_numpy(dtype=np.float32)
+        out[c] = arr
+    frames.clear()
+    return pd.DataFrame(out, copy=False)
+
+
+def add_derived(df, inplace=False):
     if df.attrs.get('derived'):
         return df
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
 
     def b01(s, cond):
         return np.where(s.isna(), np.nan, cond.astype(float))
@@ -2321,7 +2371,9 @@ def store_bt_df(df):
     全美股約20萬筆時可省下大半記憶體（Streamlit Cloud 記憶體上限約 1GB，超過會整個 App 當掉）"""
     if df is None or not len(df):
         return df
-    df = add_derived(df)
+    df = add_derived(df, inplace=True)   # 剛跑完／剛載入的資料不再複製一份，省一倍記憶體高峰
+    for c in [c for c in DEAD_BT_COLS if c in df.columns]:
+        del df[c]
     for c in df.columns:
         if c in ('evalDate', 'stockId', 'name'):
             continue
@@ -2544,8 +2596,9 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                 done += 1
                 last_progress = time.time()
                 if d is not None:
-                    frames.append(d)
                     saved += len(d)
+                    frames.append(frame_arrays(d))
+                    del d
                 else:
                     fail(err)
                 if on_progress:
@@ -2586,13 +2639,11 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
         fut_sid = pending = None                         # 釋放 future 持有的結果，避免和 frames 重複佔記憶體
     if on_progress:
         on_progress(total, total, saved, failed, None, '')
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    frames.clear()
+    df = low_mem_concat(frames)   # 已依 evalDate、stockId 排序
     import gc
     gc.collect()
     if len(df):
         df['evalDate'] = df['evalDate'].astype(str)
-        df = df.sort_values(['evalDate', 'stockId']).reset_index(drop=True)
     top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:5]
     return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg,
                     top_fail=[f'{m}（{c}次）' for m, c in top])
