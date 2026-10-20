@@ -4369,8 +4369,9 @@ def main():
 
         st.divider()
         st.markdown('**🔬 歷史回測分析（美股，預設全美股約2000檔）**')
-        bt_univ = st.selectbox('回測股票池', ['全美股（約2000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
-                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，股價≥10美元、成交金額≥1000萬美元，依成交金額取前2000檔）')
+        bt_univ = st.selectbox('回測股票池', ['全美股2000-A（約1000檔）', '全美股2000-B（約1000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
+                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，股價≥10美元、成交金額≥1000萬美元，依成交金額取前2000檔），'
+                                    '依成交金額排名交錯分成 A（第1、3、5…名）／B（第2、4、6…名）各約1000檔，記憶體減半；A、B 都能代表全市場，各自跑完六段後可一起載入合併分析')
         bt_workers = st.number_input('回測平行抓取數', 1, 32, 8, 1, key='bt_workers', help='同時抓幾檔；總請求數仍受每分鐘上限控制')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
                               help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析')
@@ -4469,7 +4470,7 @@ def main():
                 try:
                     with st.spinner('📡 抓取全美股股票池（company-screener）中…'):
                         uni = fetch_market_universe(token)
-                    univ = [u['id'] for u in uni]
+                    univ = all2000_part([u['id'] for u in uni], 1 if '-B' in bt_univ else 0)
                     bt_names.update({u['id']: u['name'] for u in uni})
                 except Exception as ex:  # noqa
                     st.error(f'❌ 抓取全美股股票池失敗：{ex}')
