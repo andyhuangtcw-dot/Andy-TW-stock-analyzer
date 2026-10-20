@@ -20,6 +20,7 @@
 #  每日自動追蹤命中組合（排程用，不開介面）：
 #      python stock_analyzer_us_poc.py daily --list sp500 --token 你的FMP_API_Key
 # ════════════════════════════════════════════════════════════════════
+import bisect
 import math
 import re
 import json
@@ -1209,7 +1210,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     else:   # 回測：當下這根K棒算（中期動能需要大盤）
         row.update(tech_extras(b, e))
         row.update(mid_momentum(b, e, bm))
-    for k in ('epsSurprise', 'earnDays', 'earnGap20') + PT_KEYS:
+    for k in ('epsSurprise', 'earnDays', 'earnGap20') + PT_KEYS + EV_KEYS:
         if k in ex:
             row[k] = ex[k]
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -1378,6 +1379,26 @@ def build_condition_flags(df: pd.DataFrame):
         F['近1季財報EPS低於預期'] = es.lt(0) & recent
     if has('earnGap20'):
         F['近20日財報跳空上漲'] = eq1('earnGap20')
+    # 2026-10-20 新增：營收驚喜、股數變化、評等升降、內部人買進、VIX（待回測驗證）
+    if has('revSurprise') and has('earnDays'):
+        rsp, red = df['revSurprise'], df['earnDays'].le(63)
+        F['近1季營收優於預期'] = rsp.gt(0) & red
+        F['近1季營收低於預期'] = rsp.lt(0) & red
+        if has('epsSurprise'):
+            F['近1季EPS與營收雙優於預期'] = df['epsSurprise'].gt(0) & rsp.gt(0) & red
+    if has('shsChg1y'):
+        F['流通股數近一年減少≥2%(庫藏股)'] = df['shsChg1y'].le(-2)
+        F['流通股數近一年增加≥5%(稀釋)'] = df['shsChg1y'].ge(5)
+    if has('gUp30'):
+        F['近30日升評(升評>降評)'] = df['gUp30'].gt(_col(df, 'gDn30').fillna(0))
+        F['近30日降評(降評>升評)'] = _col(df, 'gDn30').gt(df['gUp30'].fillna(0))
+    if has('insBuyN90'):
+        F['近90日內部人買進'] = df['insBuyN90'].ge(1)
+        F['近90日≥2位內部人買進'] = df['insBuyN90'].ge(2)
+    if has('vix'):
+        F['VIX≥30(恐慌)'] = df['vix'].ge(30)
+        F['VIX≥25(偏高)'] = df['vix'].ge(25)
+        F['VIX<15(過度樂觀)'] = df['vix'].lt(15)
     # 2026-10-20 新增：分析師目標價（待回測驗證）
     if has('ptUpside'):
         F['目標價上檔空間≥20%'] = df['ptUpside'].ge(20)
@@ -1709,7 +1730,8 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
 # 擇時型因子：這些條件本身描述的是「大盤／整體位置」，含這些條件的高勝率組合，勝率多半來自
 # 「出現在大盤反彈的日子」（2026-09-27 台股回測：扣掉同日大盤後超額報酬≈0），
 # 適合拿來判斷大盤是否落底，不適合當選股依據。
-TIMING_FACTORS = {'布林通道低檔(≤20%)', '大盤跌破20日均線', '大盤跌破60日均線', '類股跌破20日均線', '類股跌破60日均線'}
+TIMING_FACTORS = {'布林通道低檔(≤20%)', '大盤跌破20日均線', '大盤跌破60日均線', '類股跌破20日均線', '類股跌破60日均線',
+                  'VIX≥30(恐慌)', 'VIX≥25(偏高)', 'VIX<15(過度樂觀)'}
 
 
 def is_timing_combo(combo):
@@ -1969,7 +1991,8 @@ def fetch_earnings_hist(sid, token, limit=24):
                 return float(v) if v is not None else None
             except Exception:  # noqa
                 return None
-        out.append(dict(date=d, act=f(x.get('epsActual')), est=f(x.get('epsEstimated')), raw=x))
+        out.append(dict(date=d, act=f(x.get('epsActual')), est=f(x.get('epsEstimated')),
+                        ract=f(x.get('revenueActual')), rest=f(x.get('revenueEstimated')), raw=x))
     out.sort(key=lambda h: h['date'])
     return out
 
@@ -1984,7 +2007,7 @@ def earnings_feats(b, e, hist):
     """截至第 e 根K棒（含）最近一次「已公布」的財報（日期≤當天且有實際EPS），只用當時已知的資料：
     epsSurprise＝(實際EPS−預估EPS)÷|預估|×100（限 ±500）；earnDays＝距財報日的交易日數；
     earnGap20＝財報反應日（財報當天或隔天）向上跳空、且距今≤20個交易日。沒有財報資料時全部 None"""
-    out = dict(epsSurprise=None, earnDays=None, earnGap20=None)
+    out = dict(epsSurprise=None, earnDays=None, earnGap20=None, revSurprise=None)
     if not hist or e < 1:
         return out
     ds = b.date[e]
@@ -2001,6 +2024,9 @@ def earnings_feats(b, e, hist):
         out['epsSurprise'] = max(-500.0, min(500.0, (last['act'] - last['est']) / abs(last['est']) * 100))
     gap = any(1 <= j <= e and b.low[j] > b.high[j - 1] for j in (k, k + 1))
     out['earnGap20'] = int(gap and (e - k) <= 20)
+    ra, re_ = last.get('ract'), last.get('rest')
+    if ra is not None and re_ is not None and abs(re_) > 1e-9:   # 營收驚喜（%，限 ±100）
+        out['revSurprise'] = max(-100.0, min(100.0, (ra - re_) / abs(re_) * 100))
     return out
 
 
@@ -2059,6 +2085,124 @@ def pt_feats(b, e, hist, inclusive=False):
     if len(last) >= 3 and b.close[e]:
         out['ptUpside'] = (sum(last.values()) / len(last) / b.close[e] - 1) * 100
     return out
+
+
+# ── 2026-10-20 美股新增：評等升降、內部人買進、流通股數變化、VIX（都只用「當時」已公布的資料）──
+EV_KEYS = ('revSurprise', 'shsChg1y', 'gUp30', 'gDn30', 'insBuyN90', 'insBuyVal90', 'vix')
+VIX_ID = '^VIX'
+
+
+def fetch_shares_hist(sid, token, limit=24):
+    """季報加權平均流通股數 → [(可得日, 期末日, 股數)]；可得日用 filingDate，沒有就用期末＋45天"""
+    j = fmp_get('/income-statement', dict(symbol=to_fmp_symbol(sid), period='quarter', limit=limit), token)
+    out = []
+    for r in j if isinstance(j, list) else []:
+        d = str(r.get('date') or '')[:10]
+        sh = r.get('weightedAverageShsOutDil') or r.get('weightedAverageShsOut')
+        try:
+            sh = float(sh)
+        except Exception:  # noqa
+            continue
+        if len(d) < 10 or not sh > 0:
+            continue
+        fd = str(r.get('filingDate') or r.get('acceptedDate') or '')[:10]
+        av = fd if len(fd) == 10 else _ds(dt.date.fromisoformat(d) + dt.timedelta(days=45))
+        out.append((av, d, sh))
+    out.sort()
+    return out
+
+
+def shares_feats(ds, hist, inclusive=False):
+    """shsChg1y＝最新一季（已公布）流通股數比一年前同季（期末日差 300～430 天）變化 %"""
+    if not hist:
+        return {'shsChg1y': None}
+    known = [h for h in hist if (h[0] <= ds if inclusive else h[0] < ds)]
+    if not known:
+        return {'shsChg1y': None}
+    cur = max(known, key=lambda h: h[1])
+    d1 = dt.date.fromisoformat(cur[1])
+    old = [h for h in known if 300 <= (d1 - dt.date.fromisoformat(h[1])).days <= 430]
+    if not old:
+        return {'shsChg1y': None}
+    o = min(old, key=lambda h: abs((d1 - dt.date.fromisoformat(h[1])).days - 365))
+    return {'shsChg1y': (cur[2] / o[2] - 1) * 100}
+
+
+def fetch_grades_hist(sid, token):
+    """/grades 評等異動 → [{date, firm, act}]；act：+1 升評、-1 降評、0 維持／新增"""
+    j = fmp_get('/grades', dict(symbol=to_fmp_symbol(sid), limit=1000), token)
+    out = []
+    for x in j if isinstance(j, list) else []:
+        d = str(x.get('date') or '')[:10]
+        if len(d) < 10:
+            continue
+        a = str(x.get('action') or '').lower()
+        out.append(dict(date=d, firm=str(x.get('gradingCompany') or ''), act=1 if 'up' in a else (-1 if 'down' in a else 0)))
+    out.sort(key=lambda h: h['date'])
+    return out
+
+
+def grade_feats(ds, hist, inclusive=False):
+    """gUp30／gDn30＝近30日升評／降評家數；評等歷史最早一筆晚於當天 → None"""
+    if not hist or (hist[0]['date'] > ds):
+        return {'gUp30': None, 'gDn30': None}
+    c30 = _ds(dt.date.fromisoformat(ds) - dt.timedelta(days=30))
+    w = [h for h in hist if h['date'] >= c30 and (h['date'] <= ds if inclusive else h['date'] < ds)]
+    return {'gUp30': sum(1 for h in w if h['act'] > 0), 'gDn30': sum(1 for h in w if h['act'] < 0)}
+
+
+def fetch_insider_hist(sid, token, since, page_size=100, max_pages=10):
+    """/insider-trading/search 逐頁抓到 since 為止 → 公開市場買進（P-Purchase）[{date(申報日), who, val}]；
+    另回傳實際涵蓋到的最早申報日（判斷「當時有沒有資料」）"""
+    out, oldest_all = [], None
+    for pg in range(max_pages):
+        j = fmp_get('/insider-trading/search', dict(symbol=to_fmp_symbol(sid), page=pg, limit=page_size), token)
+        j = j if isinstance(j, list) else []
+        oldest = None
+        for x in j:
+            d = str(x.get('filingDate') or x.get('transactionDate') or '')[:10]
+            if len(d) < 10:
+                continue
+            oldest = d if oldest is None or d < oldest else oldest
+            tt_ = str(x.get('transactionType') or '')
+            if not tt_.upper().startswith('P'):
+                continue
+            try:
+                val = float(x.get('securitiesTransacted') or 0) * float(x.get('price') or 0)
+            except Exception:  # noqa
+                val = 0.0
+            out.append(dict(date=d, who=str(x.get('reportingName') or x.get('reportingCik') or ''), val=val))
+        if oldest:
+            oldest_all = oldest if oldest_all is None or oldest < oldest_all else oldest_all
+        if len(j) < page_size or oldest is None or oldest < since:
+            break
+    out.sort(key=lambda h: h['date'])
+    return out, oldest_all
+
+
+def insider_feats(ds, ih, inclusive=False):
+    """insBuyN90＝近90日（依申報日）公開市場買進的不同內部人數；insBuyVal90＝買進金額（美元）"""
+    hist, oldest = ih if ih else ([], None)
+    if oldest is None or oldest > ds:
+        return {'insBuyN90': None, 'insBuyVal90': None}
+    c90 = _ds(dt.date.fromisoformat(ds) - dt.timedelta(days=90))
+    w = [h for h in hist if h['date'] >= c90 and (h['date'] <= ds if inclusive else h['date'] < ds)]
+    return {'insBuyN90': len({h['who'] for h in w}), 'insBuyVal90': sum(h['val'] for h in w)}
+
+
+def fetch_vix(token, days):
+    try:
+        rows = fetch_price(VIX_ID, token, days)
+        return [r['date'] for r in rows], [r['close'] for r in rows]
+    except Exception:  # noqa
+        return None
+
+
+def vix_asof(vx, ds):
+    if not vx:
+        return None
+    i = bisect.bisect_right(vx[0], ds) - 1
+    return vx[1][i] if i >= 0 else None
 
 
 def fetch_pt_consensus(sid, token):
@@ -2617,7 +2761,7 @@ def prep_analysis_df(df, min_px=10.0, wq=0.01):
 
 def run_backtest(token, universe, months_back, include_div, include_sector, min_liq, vp_params,
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
-                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False):
+                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
     universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
     buf = 60
@@ -2628,12 +2772,15 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     bm_err = None
     try:
         bm = fetch_benchmark(token, price_days)
+        vx = fetch_vix(token, price_days)   # VIX：整次回測抓一次（抓不到就不出現 VIX 條件）
     except Exception as ex:  # noqa
         bm, bm_err = None, str(ex)
     if include_sector:
         reset_sector_cache()
     names = names or {}
     total = len(universe)
+    vx = locals().get('vx')
+    ev_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('shares', 'grades', 'insider')}
     pt_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 前20檔目標價全部失敗（方案不支援）→ 之後不再抓，省API
     pt_lock = threading.Lock()
 
@@ -2681,6 +2828,25 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                         pt_state['err'] = str(ex_)[:150]
                         if pt_state['ok'] == 0 and pt_state['fail'] >= 20:
                             pt_state['off'] = True
+            evh = {}
+            if include_ev:   # 評等升降／內部人買進／流通股數：各自前20檔全部失敗（方案不支援）就停止抓
+                since_ev = _ds(dt.date.fromisoformat(win_start) - dt.timedelta(days=430))
+                for k_, fn_ in (('shares', lambda: fetch_shares_hist(sid, token, limit=math.ceil((months_back + off) / 3) + 10)),
+                                ('grades', lambda: fetch_grades_hist(sid, token)),
+                                ('insider', lambda: fetch_insider_hist(sid, token, since_ev))):
+                    stt_ = ev_state[k_]
+                    if stt_['off']:
+                        continue
+                    try:
+                        evh[k_] = fn_()
+                        with pt_lock:
+                            stt_['ok'] += 1
+                    except Exception as ex_:  # noqa
+                        with pt_lock:
+                            stt_['fail'] += 1
+                            stt_['err'] = str(ex_)[:150]
+                            if stt_['ok'] == 0 and stt_['fail'] >= 20:
+                                stt_['off'] = True
             pc = PatternCache(b)
             recs = []
             for e in range(buf, ev_end):
@@ -2701,6 +2867,14 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                     ex.update(earnings_feats(b, e, ehist))
                 if pth is not None:
                     ex.update(pt_feats(b, e, pth))
+                if 'shares' in evh:
+                    ex.update(shares_feats(ds, evh['shares']))
+                if 'grades' in evh:
+                    ex.update(grade_feats(ds, evh['grades']))
+                if 'insider' in evh:
+                    ex.update(insider_feats(ds, evh['insider']))
+                if vx:
+                    ex['vix'] = vix_asof(vx, ds)
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
                 ec = b.close[e]
                 row['entryClose'] = ec
@@ -2812,9 +2986,13 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     if len(df):
         df['evalDate'] = df['evalDate'].astype(str)
     top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:5]
+    ev_err = '；'.join(f"{dict(shares='流通股數', grades='評等升降', insider='內部人交易')[k]} {v['fail']} 檔抓取失敗"
+                       + ('（前20檔全部失敗已停止）' if v['off'] else '') + f"：{v['err']}"
+                       for k, v in ev_state.items() if include_ev and v['fail']) or None
     pt_err = (f"目標價（price-target-news）{pt_state['fail']} 檔抓取失敗" + ('，前20檔全部失敗已停止抓取' if pt_state['off'] else '')
               + f"：{pt_state['err']}") if include_pt and pt_state['fail'] else None
-    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err,
+    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err, ev_err=ev_err,
+                    vix_err=None if vx else 'VIX（^VIX）抓不到，VIX 條件這次不會出現',
                     top_fail=[f'{m}（{c}次）' for m, c in top])
 
 
@@ -3056,6 +3234,12 @@ def market_panel_lines(results, K):
         lines.append(f"🌡️ 大盤溫度計：這次只分析 {mt['n']} 檔，少於 {MKT_MIN_STOCKS} 檔無法代表全市場（請用全市場／S&P500 等大清單）")
     if kp:
         lines.append(f"📉 大盤K線位置：**{kp['zone']}**（距60日高 {kp['dd60']:+.1f}%、RSI {kp['rsi']:.0f}、均線{kp['ma']}）→ {_zone_hist('KLINE', kp['zone'])}")
+    vxr = next((r.get('vix') for r in results if r.get('vix')), None)
+    if vxr:
+        v = vxr[1][-1]
+        z = '恐慌' if v >= 30 else ('偏高' if v >= 25 else ('偏低（過度樂觀）' if v < 15 else '正常'))
+        lines.append(f"😱 VIX：**{v:.1f}（{z}）**　近一年區間 {min(vxr[1][-252:]):.1f}～{max(vxr[1][-252:]):.1f}"
+                     "（VIX≥30 歷史上多半接近中期低點；<15 代表市場過度樂觀。VIX 條件已加入回測，待驗證後再納入建議持股）")
     hot = (mt['zone'] in ('偏熱', '過熱')) + (kp is not None and kp['zone'] == '過熱')
     cold = (mt['zone'] in ('極冷', '偏冷')) + (kp is not None and kp['zone'] == '超賣')
     if cold == 2:
@@ -3191,6 +3375,13 @@ def summary_frame(results, extras_flags, K, live=None):
             p = r.get('peRange')
             rec['P/E'] = p['current'] if p else None
             rec['P/E區間'] = f"{p['min']:.1f}~{p['max']:.1f}" if p else ('⚠️ 讀取失敗' if r.get('peRangeErr') else '無資料')
+        rw_ = r['row']
+        if isnum(rw_.get('revSurprise')) and isnum(rw_.get('earnDays')) and rw_['earnDays'] <= 63:
+            rec['營收驚喜%'] = round(rw_['revSurprise'], 1)
+        if extras_flags.get('ev'):
+            rec['流通股數1年%'] = round(rw_['shsChg1y'], 1) if isnum(rw_.get('shsChg1y')) else None
+            rec['近30日升/降評'] = f"↑{int(rw_['gUp30'])} ↓{int(rw_['gDn30'])}" if isnum(rw_.get('gUp30')) else '無資料'
+            rec['近90日內部人買進'] = (f"{int(rw_['insBuyN90'])}人 ${rw_['insBuyVal90'] / 1e6:.2f}M" if rw_['insBuyN90'] else '0') if isnum(rw_.get('insBuyN90')) else '無資料'
         if extras_flags.get('pt'):
             pi = r.get('ptInfo') or {}
             up = pi.get('ptUpside')
@@ -3219,6 +3410,8 @@ def summary_frame(results, extras_flags, K, live=None):
             bt = best_t(combo_stats(c, kind, K, live))
             return f'(t{bt:.1f})' if bt is not None else ''
         rec['選股型命中'] = ' '.join(f'S{i + 1}' + _t(K['STOCK_PICK_COMBOS'][i], 'S') for i in ms)
+        if ms and isnum(r['row'].get('ptRevNet30')) and r['row']['ptRevNet30'] < 0:   # 回測：S命中但近30日目標價下調，超額 1.82%→0.56%
+            rec['選股型命中'] += ' ⚠️目標價下調'
         rec['指定組合命中'] = ' '.join([f'#{i + 1}' + ('⏱' if is_timing_combo(K['PINNED_COMBOS'][i]) else '')
                                     + _t(K['PINNED_COMBOS'][i], '#') for i in mp]
                                    + [f'M{i + 1}' + _t(K['MOONSHOT_COMBOS'][i], 'M') for i in mm])
@@ -3557,6 +3750,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
         log(f'⚠️ 抓不到大盤(SPY)資料，相對強弱／大盤濾網這次不會出現：{ex}')
     if ex_flags.get('sector'):
         reset_sector_cache()
+    vx_live = fetch_vix(token, 400)   # VIX：大盤面板顯示＋VIX 條件（整批一次）
     try:
         earn_cal = fetch_earnings_calendar(token)
     except Exception as ex:  # noqa
@@ -3586,6 +3780,17 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
                     extras['peRange'] = fetch_pe_range(sid, token)
                 except Exception as ex2:  # noqa
                     extras['peRangeErr'] = str(ex2)
+            if vx_live:
+                tech['vix'] = vx_live[1][-1]
+            if ex_flags.get('ev'):   # 評等升降／內部人買進／流通股數（各 1 次 API，內部人可能 1～2 次）
+                td_ = _ds(dt.date.today())
+                for fn_ in (lambda: shares_feats(td_, fetch_shares_hist(sid, token, limit=8), True),
+                            lambda: grade_feats(td_, fetch_grades_hist(sid, token), True),
+                            lambda: insider_feats(td_, fetch_insider_hist(sid, token, _ds(dt.date.today() - dt.timedelta(days=100))), True)):
+                    try:
+                        tech.update(fn_())
+                    except Exception as ex3:  # noqa
+                        extras['evErr'] = str(ex3)[:150]
             if ex_flags.get('pt'):   # 分析師目標價：逐筆目標價算上檔空間／近30日調整；抓不到改用共識目標價
                 try:
                     pth = fetch_pt_hist(sid, token, _ds(dt.date.today() - dt.timedelta(days=400)))
@@ -3630,7 +3835,8 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
     results.sort(key=lambda r: -r['total'])
     _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
     for r in results:
-        r['bm_close'] = _bmc   # 大盤K線位置用（同一份清單，不重複佔記憶體）
+        r['bm_close'] = _bmc
+        r['vix'] = vx_live   # 大盤K線位置用（同一份清單，不重複佔記憶體）
     ensure_flagsets(results)
     return results
 
@@ -4027,7 +4233,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-20 目標價／P/E位階'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-20b 評等／內部人／股數／VIX'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4132,6 +4338,7 @@ def main():
         st.caption('以下每勾一項，每檔股票多打1次API：')
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'),
                         pt=st.checkbox('🎯 分析師目標價（上檔空間、近30日調整；每檔多1～3次API）', key='x_pt'),
+                        ev=st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～4次API）', key='x_ev'),
                         rev=st.checkbox('📈 近3季營收YoY/QoQ', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3季均價YoY', key='x_pxyoy'),
                         sector=st.checkbox('🏭 類股狀態濾網（所屬類股ETF站上/跌破20、60日均線）', key='x_sector'))
@@ -4180,6 +4387,8 @@ def main():
                               help='美股最穩定的異常之一：財報 EPS 優於預期、財報日向上跳空的股票，之後1～3個月常持續走強（PEAD）')
         bt_pt = st.checkbox('🎯 分析師目標價（price-target-news；每檔多1～15次查詢，大型股較多）', False, key='bt_pt',
                             help='目標價上檔空間≥20%／≥40%、股價高於目標價、近30日目標價上調／下調。若方案不支援，前20檔都失敗會自動停止抓取')
+        bt_ev = st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～6次查詢）', False, key='bt_ev',
+                            help='近30日升評／降評、近90日內部人公開市場買進（1人／≥2人）、流通股數近一年減少≥2%（庫藏股）／增加≥5%（稀釋）。營收驚喜跟財報一起抓、VIX 整次回測抓一次，都不用另外勾')
         bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
         bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
@@ -4286,13 +4495,16 @@ def main():
                             + (f'　｜{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp,
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx),
-                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt)
+                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev)
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             if stt.get('stopped'):
                 st.warning(f"⚠️ 回測提前結束：{stt['stopped']}")
             if stt.get('pt_err'):
                 st.warning('⚠️ ' + stt['pt_err'])
+            for k_ in ('ev_err', 'vix_err'):
+                if stt.get(k_):
+                    st.warning('⚠️ ' + stt[k_])
             if stt.get('bm_err'):
                 st.warning(f"⚠️ 這次回測抓不到大盤(SPY)資料，相對強弱／大盤濾網不會出現：{stt['bm_err']}")
             if not len(df):
@@ -6143,6 +6355,7 @@ BT_HOT_COMBOS = [
     ["半年強勢(6-1月勝大盤≥10%)", "OBV能量潮創60日新高", "短線過熱(高於月線≥20%)"],
     ["均線多頭排列(5>20>60且站上月線)", "OBV能量潮創60日新高", "短線過熱(高於月線≥20%)"],
 
+    ["目標價上檔空間≥40%", "中期強勢(12-1月勝大盤≥20%)"],   # 2026-10-20 新增（S&P500 三年六段、目標價回測）：飆股比例 5.5%（全體 5.5 倍；三年各 3.8／13.8／3.5 倍）
 ]
 BT_HOT_STATS = {
     "爆量(≥2倍均量) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": {"10": {"n": 700, "moonshotN": 57, "pct": 8.1, "avg": 57.4}, "20": {"n": 700, "moonshotN": 95, "pct": 13.6, "avg": 59.6}},
@@ -6446,6 +6659,7 @@ BT_HOT_STATS = {
     "半年強勢(6-1月勝大盤≥10%) ＋ OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": {"10": {"n": 2043, "moonshotN": 87, "pct": 4.3, "avg": 49.9}, "20": {"n": 2043, "moonshotN": 212, "pct": 10.4, "avg": 50.8}},
     "均線多頭排列(5>20>60且站上月線) ＋ OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": {"10": {"n": 3563, "moonshotN": 149, "pct": 4.2, "avg": 53.5}, "20": {"n": 3563, "moonshotN": 328, "pct": 9.2, "avg": 52.4}},
 
+    "目標價上檔空間≥40% ＋ 中期強勢(12-1月勝大盤≥20%)": {"10": {"n": 2845, "moonshotN": 48, "pct": 1.7, "avg": 44.6}, "20": {"n": 2845, "moonshotN": 156, "pct": 5.5, "avg": 42.5}},
 }
 BT_HIT_SHOW = 3   # 摘要表每類最多顯示幾個編號，其餘以「+N」表示
 
@@ -6883,6 +7097,7 @@ REGIME_STATS = {
     "回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[1266, 50.3, 1.21, 1.98], [153, 34.0, -6.3, -2.28], None, [110, 50.9, 0.64, -0.92]],
     "OBV能量潮創60日新高 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1680, 48.9, 1.26, 2.58], [201, 35.3, -6.2, -1.93], [38, 86.8, 10.04, 2.36], [124, 53.2, 1.9, 0.58]],
     "OBV能量潮創60日新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[2980, 51.6, 1.75, 4.09], [332, 41.6, -3.7, -1.74], [44, 70.5, 2.22, 0.48], [207, 48.3, 0.23, -0.99]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 目標價上檔空間≥40%": [[1573, 54.4, 1.43, 2.36], [493, 57.4, 2.8, 2.28], [51, 86.3, 9.53, 3.56], [728, 71.6, 5.55, 7.02]],
 }
 
 
