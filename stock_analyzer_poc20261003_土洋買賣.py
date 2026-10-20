@@ -3761,6 +3761,8 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
+APP_VERSION = '2026-10-20 目標價／P/E位階'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+
 CSS = """
 <style>
 .block-container{padding-top:1.4rem}
@@ -3817,7 +3819,7 @@ def main():
     # ────────────────────────────── 側邊欄 ──────────────────────────────
     with st.sidebar:
         st.markdown('### 📊 技術分析全攻略')
-        st.caption('朱家泓方法論 · 個股評分系統（POC 分價量表版）')
+        st.caption('朱家泓方法論 · 個股評分系統（POC 分價量表版）　｜　版本 ' + APP_VERSION)
         st.text_input('FinMind API Token', type='password', key='token')
         lst_names = ['上市清單', '上櫃清單', '0050成分股', *CUSTOM_SLOTS]
         st.selectbox('載入股票清單', lst_names, key='list_choice', on_change=list_choice_changed,
