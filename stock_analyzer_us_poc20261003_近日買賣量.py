@@ -1210,7 +1210,9 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     else:   # 回測：當下這根K棒算（中期動能需要大盤）
         row.update(tech_extras(b, e))
         row.update(mid_momentum(b, e, bm))
-    for k in ('epsSurprise', 'earnDays', 'earnGap20') + PT_KEYS + EV_KEYS:
+        row.update(risk_feats(b, e, bm))
+    row['secMom'] = sector_mom(sb, bm, b.date[e])
+    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS:
         if k in ex:
             row[k] = ex[k]
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -1399,6 +1401,22 @@ def build_condition_flags(df: pd.DataFrame):
         F['VIX≥30(恐慌)'] = df['vix'].ge(30)
         F['VIX≥25(偏高)'] = df['vix'].ge(25)
         F['VIX<15(過度樂觀)'] = df['vix'].lt(15)
+    # 2026-10-22 新增：純價格的風險／時機因子（待回測驗證）
+    if has('max1d20'):
+        F['近20日單日最大漲幅≥10%(樂透股)'] = df['max1d20'].ge(10)
+    if has('ivol60'):
+        F['低特有波動(年化≤20%)'] = df['ivol60'].le(20)
+        F['高特有波動(年化≥60%)'] = df['ivol60'].ge(60)
+    if has('beta60'):
+        F['低Beta(<0.8)'] = df['beta60'].lt(0.8)
+        F['高Beta(>1.5)'] = df['beta60'].gt(1.5)
+    if has('ret20'):
+        F['近20日跌幅≥10%(一個月反轉)'] = df['ret20'].le(-10)
+    if has('earnNext'):
+        F['距下次財報≤10個交易日'] = df['earnNext'].ge(1) & df['earnNext'].le(10)
+    if has('secMom'):
+        F['所屬類股近6個月強於大盤'] = df['secMom'].gt(0)
+        F['所屬類股近6個月弱於大盤'] = df['secMom'].lt(0)
     # 2026-10-20 新增：分析師目標價（待回測驗證）
     if has('ptUpside'):
         F['目標價上檔空間≥20%'] = df['ptUpside'].ge(20)
@@ -2007,10 +2025,14 @@ def earnings_feats(b, e, hist):
     """截至第 e 根K棒（含）最近一次「已公布」的財報（日期≤當天且有實際EPS），只用當時已知的資料：
     epsSurprise＝(實際EPS−預估EPS)÷|預估|×100（限 ±500）；earnDays＝距財報日的交易日數；
     earnGap20＝財報反應日（財報當天或隔天）向上跳空、且距今≤20個交易日。沒有財報資料時全部 None"""
-    out = dict(epsSurprise=None, earnDays=None, earnGap20=None, revSurprise=None)
+    out = dict(epsSurprise=None, earnDays=None, earnGap20=None, revSurprise=None, earnNext=None)
     if not hist or e < 1:
         return out
     ds = b.date[e]
+    nxt = next((h['date'] for h in hist if h['date'] > ds), None)   # 距下次財報幾個交易日（財報日通常幾週前就公告）
+    if nxt:
+        bd = int(np.busday_count(ds, nxt))
+        out['earnNext'] = bd if bd <= 90 else None
     past = [h for h in hist if h['date'] <= ds and h['act'] is not None]
     if not past:
         return out
@@ -2125,7 +2147,8 @@ def shares_feats(ds, hist, inclusive=False):
     if not old:
         return {'shsChg1y': None}
     o = min(old, key=lambda h: abs((d1 - dt.date.fromisoformat(h[1])).days - 365))
-    return {'shsChg1y': (cur[2] / o[2] - 1) * 100}
+    chg = (cur[2] / o[2] - 1) * 100
+    return {'shsChg1y': chg if abs(chg) <= 40 else None}   # 超過±40%多半是分割／反分割（股數沒還原），不算
 
 
 def fetch_grades_hist(sid, token):
@@ -2209,6 +2232,49 @@ def fetch_pt_consensus(sid, token):
     j = fmp_get('/price-target-consensus', dict(symbol=to_fmp_symbol(sid)), token)
     j = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else None)
     return j or None
+
+
+# ── 2026-10-22 美股新增：純價格的風險／時機因子（不多花 API）──
+RISK_KEYS = ('max1d20', 'ivol60', 'beta60', 'ret20', 'earnNext', 'secMom')
+
+
+def risk_feats(b, e, bm):
+    """max1d20＝近20日單日最大漲幅%（樂透股效應）；ret20＝近20日漲跌%（一個月反轉）；
+    beta60／ivol60＝近60日對大盤（SPY）的 Beta 與扣掉大盤後的特有波動（年化%）"""
+    out = dict(max1d20=None, ivol60=None, beta60=None, ret20=None)
+    c = b.close
+    if e >= 20 and c[e - 20]:
+        out['max1d20'] = max((c[k] / c[k - 1] - 1) * 100 for k in range(e - 19, e + 1) if c[k - 1])
+        out['ret20'] = (c[e] / c[e - 20] - 1) * 100
+    if e >= 60 and bm is not None:
+        rs, rm = [], []
+        for k in range(e - 59, e + 1):
+            i1, i0 = bm.find(b.date[k]), bm.find(b.date[k - 1])
+            if i1 > 0 and i0 >= 0 and i1 != i0 and c[k - 1] and bm.close[i0]:
+                rs.append(c[k] / c[k - 1] - 1)
+                rm.append(bm.close[i1] / bm.close[i0] - 1)
+        if len(rs) >= 40:
+            rs, rm = np.array(rs), np.array(rm)
+            vm = rm.var(ddof=1)
+            if vm > 0:
+                beta = float(((rs - rs.mean()) * (rm - rm.mean())).sum() / (len(rs) - 1) / vm)
+                out['beta60'] = beta
+                out['ivol60'] = float((rs - beta * rm).std(ddof=1) * math.sqrt(252) * 100)
+    return out
+
+
+def sector_mom(sb, bm, ds):
+    """所屬類股 ETF 近6個月（扣最近1個月）報酬 − 同期 SPY（百分點）"""
+    if not sb or bm is None:
+        return None
+    i = sb.find(ds)
+    if i < 126:
+        return None
+    j, k = i - 21, i - 126
+    a, z = bm.find(sb.date[j]), bm.find(sb.date[k])
+    if a < 0 or z < 0 or not sb.close[k] or not bm.close[z]:
+        return None
+    return ((sb.close[j] / sb.close[k] - 1) - (bm.close[a] / bm.close[z] - 1)) * 100
 
 
 def mid_momentum(b, e, bm):
@@ -3240,6 +3306,9 @@ def market_panel_lines(results, K):
         z = '恐慌' if v >= 30 else ('偏高' if v >= 25 else ('偏低（過度樂觀）' if v < 15 else '正常'))
         lines.append(f"😱 VIX：**{v:.1f}（{z}）**　近一年區間 {min(vxr[1][-252:]):.1f}～{max(vxr[1][-252:]):.1f}"
                      "（VIX≥30 歷史上多半接近中期低點；<15 代表市場過度樂觀。VIX 條件已加入回測，待驗證後再納入建議持股）")
+    _mpl = mp_panel_line(next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))
+    if _mpl:
+        lines.append(_mpl)
     hot = (mt['zone'] in ('偏熱', '過熱')) + (kp is not None and kp['zone'] == '過熱')
     cold = (mt['zone'] in ('極冷', '偏冷')) + (kp is not None and kp['zone'] == '超賣')
     if cold == 2:
@@ -3270,10 +3339,14 @@ def market_position(mt, kp):
     return pct, act, sc, '、'.join(parts)
 
 
-def market_guide_lines(mt, kp):
-    """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）"""
+def market_guide_lines(mt, kp, pred=None):
+    """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）；
+    大盤預測評分卡樣本外驗證有效時，建議持股改用評分卡"""
     out = []
     ps = market_position(mt, kp)
+    if pred and not pred.get('err') and pred.get('valid') and pred.get('models'):
+        out.append(mp_guide_text(pred, ps[0] if ps else None))
+        ps = None
     if ps:
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
                    + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
@@ -3329,6 +3402,484 @@ def market_guide_lines(mt, kp):
             w.append('最佳時機＝K線「超賣」且溫度計同時「偏冷／極冷」')
         out.append('・接下來觀察：' + '；'.join(w))
     return out
+
+
+# ── 大盤預測評分卡：美股的大盤指標 ──
+MP_FILE_NAME = 'market_scorecard_us.json'
+MP_MARKET = '美股'
+MP_DESC = 'SPY 位置與動能、VIX、10年−2年公債利差、HYG/IEF 信用指標'
+MP_LIVE_COST = '10 次 API'
+
+
+def _mpf(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except Exception:  # noqa
+        return None
+
+
+def mp_fetch(token, years, log=None):
+    start = dt.date.today() - dt.timedelta(days=int(years * 365.25))
+    H = {'idx': fetch_price('SPY', token, start=start)}
+    for k, sym in (('vix', '^VIX'), ('hyg', 'HYG'), ('ief', 'IEF')):
+        try:
+            H[k] = fetch_price(sym, token, start=start)
+        except Exception:  # noqa
+            H[k] = None
+    tr, d0 = [], start
+    try:   # /treasury-rates 一次最多約3個月 → 分段抓
+        while d0 <= dt.date.today():
+            d1 = min(dt.date.today(), d0 + dt.timedelta(days=89))
+            j = fmp_get('/treasury-rates', {'from': _ds(d0), 'to': _ds(d1)}, token)
+            tr += j if isinstance(j, list) else []
+            d0 = d1 + dt.timedelta(days=1)
+    except Exception:  # noqa
+        pass
+    H['tr'] = tr
+    return H
+
+
+def mp_features(H):
+    F, c = mp_price_feats([r['date'] for r in H['idx']], [r['close'] for r in H['idx']])
+    if H.get('vix'):
+        v = mp_align(F.index, [r['date'] for r in H['vix']], [r['close'] for r in H['vix']])
+        F['VIX'] = v
+        F['VIX近20日變化'] = v - v.shift(20)
+    if H.get('tr'):
+        rows = sorted({str(x.get('date'))[:10]: x for x in H['tr'] if x.get('date')}.items())
+        sp = [((_mpf(x.get('year10')) if _mpf(x.get('year10')) is not None else np.nan) - (_mpf(x.get('year2')) if _mpf(x.get('year2')) is not None else np.nan)) for _, x in rows]
+        if rows:
+            F['10年−2年利差'] = mp_align(F.index, [k for k, _ in rows], sp)
+    if H.get('hyg') and H.get('ief'):
+        h = mp_align(F.index, [r['date'] for r in H['hyg']], [r['close'] for r in H['hyg']])
+        i_ = mp_align(F.index, [r['date'] for r in H['ief']], [r['close'] for r in H['ief']])
+        ratio = h / i_
+        F['HYG/IEF近60日%'] = (ratio / ratio.shift(60) - 1) * 100
+    return F, c
+
+
+# ════════════════════════════════════════════════════════════════════
+#  🔮 大盤預測評分卡（2026-10-22）：用 10 年以上的大盤層級指標，逐段往前推（walk-forward）做樣本外驗證
+#  每個指標轉成「在自己過去分布裡的百分位」；每半年用「到當時為止」的資料重算各指標跟未來20日報酬的
+#  等級相關（IC），前後兩半都同方向且 |IC|≥0.03 才給權重；訓練期最後 20 天不用（避免標籤偷看測試期）。
+#  分數＝Σ 權重×(百分位−0.5)，−1～+1；樣本外依分數分五級，看各級之後20日的實際表現，
+#  五級表現單調（等級相關≥0.7）且樣本外 IC≥0.05 才算有效 → 建議持股改用評分卡
+# ════════════════════════════════════════════════════════════════════
+MP_WARM = 750      # 前約3年只當訓練，不出預測
+MP_STEP = 126      # 每半年重訓一次
+MP_EMB = 20        # 訓練期最後20天不用
+MP_MIN_IC = 0.03
+MP_MIN_HIST = 250  # 指標至少有 250 天歷史才算百分位
+MP_POS = [30, 40, 50, 65, 80]   # 樣本外五級（最差→最好）對應的建議持股%
+MP_SCHEMES = {'積極（30/40/50/65/80%）': [30, 40, 50, 65, 80], '溫和（50/55/60/65/70%）': [50, 55, 60, 65, 70]}
+MP_VT_NAME = '波動率目標（不靠模型）'
+MP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), MP_FILE_NAME)
+
+
+def _rsi_arr(c, n=14):
+    out = np.full(len(c), np.nan)
+    up = dn = None
+    for i in range(1, len(c)):
+        d = c[i] - c[i - 1]
+        u, w = max(d, 0.0), max(-d, 0.0)
+        up = u if up is None else up + (u - up) / n
+        dn = w if dn is None else dn + (w - dn) / n
+        out[i] = 100.0 if not dn else 100 - 100 / (1 + up / dn)
+    return out
+
+
+def mp_price_feats(dates, close):
+    c = pd.Series(np.asarray(close, dtype=float), index=list(dates))
+    f = pd.DataFrame(index=c.index)
+    f['距一年高點%'] = (c / c.rolling(252, min_periods=200).max() - 1) * 100
+    f['偏離200日均線%'] = (c / c.rolling(200, min_periods=180).mean() - 1) * 100
+    f['RSI14'] = _rsi_arr(c.values)
+    f['近20日漲幅%'] = (c / c.shift(20) - 1) * 100
+    f['60日波動率%'] = c.pct_change().rolling(60, min_periods=50).std() * math.sqrt(252) * 100
+    return f, c
+
+
+def mp_align(index, dates, vals, lag=0):
+    """把另一條日資料對齊到主序列日期（用當天或之前最近一筆；lag=1＝只用前一個交易日以前的，收盤後才公布的籌碼用）"""
+    s = pd.Series(np.asarray(vals, dtype=float), index=list(dates))
+    s = s[~s.index.duplicated(keep='last')].sort_index()
+    out = s.reindex(sorted(set(index) | set(s.index))).ffill().reindex(index)
+    return out.shift(lag) if lag else out
+
+
+def mp_targets(c):
+    v = c.values.astype(float)
+    n = len(v)
+    r20, d20 = np.full(n, np.nan), np.full(n, np.nan)
+    for i in range(n - 20):
+        r20[i] = (v[i + 20] / v[i] - 1) * 100
+        d20[i] = (v[i + 1:i + 21].min() / v[i] - 1) * 100
+    return r20, d20
+
+
+def _mp_pct_expanding(x):
+    srt, out = [], np.full(len(x), np.nan)
+    for i, v in enumerate(x):
+        if np.isfinite(v):
+            if len(srt) >= MP_MIN_HIST:
+                out[i] = bisect.bisect_left(srt, v) / len(srt)
+            bisect.insort(srt, v)
+    return out
+
+
+def _mp_rank(a):
+    return pd.Series(a).rank().values
+
+
+def _mp_spear(a, b, min_n=60):
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < min_n:
+        return float('nan')
+    ra, rb = _mp_rank(a[m]), _mp_rank(b[m])
+    sa, sb = ra.std(), rb.std()
+    return float(((ra - ra.mean()) * (rb - rb.mean())).mean() / (sa * sb)) if sa > 0 and sb > 0 else float('nan')
+
+
+def _mp_weights(X, y, tr):
+    k = X.shape[1]
+    w, ics = np.zeros(k), np.full(k, np.nan)
+    h = len(tr) // 2
+    for j in range(k):
+        ic = _mp_spear(X[tr, j], y[tr])
+        a, b = _mp_spear(X[tr[:h], j], y[tr[:h]]), _mp_spear(X[tr[h:], j], y[tr[h:]])
+        ics[j] = ic
+        if np.isfinite(ic) and abs(ic) >= MP_MIN_IC and np.isfinite(a) and np.isfinite(b) and np.sign(a) == np.sign(b) == np.sign(ic):
+            w[j] = ic
+    return w, ics
+
+
+def _mp_score(X, w, rows):
+    tot = np.abs(w).sum()
+    if tot == 0:
+        return np.zeros(len(rows))
+    Z = X[rows] - 0.5
+    Z = np.where(np.isfinite(Z), Z, 0.0)
+    return Z @ w / tot * 2
+
+
+MP_MODELS = (('ret', '報酬模型', '未來20日報酬'), ('risk', '風險模型', '未來20日最大跌幅'))
+# 風險模型不從資料學權重（各期間 IC 方向會翻來翻去，學出來的權重樣本外常常反向），
+# 改用市場常識固定方向、等權：+1＝數值越高之後跌幅越小，−1＝數值越高風險越大；walk-forward 只用來驗證，不調參數
+MP_RISK_PRIOR = {'距一年高點%': 1, '偏離200日均線%': 1, '60日波動率%': -1, 'VIX': -1, 'VIX近20日變化': -1, 'HYG/IEF近60日%': 1}
+
+
+def _mp_model(X, y, r, dd, n, idx, kind, fixed=None):
+    """kind='ret'：預測未來20日報酬；'risk'：預測未來20日期間最大跌幅（分數高＝跌幅小＝風險低）"""
+    k = X.shape[1]
+    pred = np.full(n, np.nan)
+    qwf = np.full(n, -1)          # 持股模擬用的分級：每段只用訓練期分數的五分位當切點
+    folds, stab_hit, stab_n = [], np.zeros(k), np.zeros(k)
+    for t in range(MP_WARM, n, MP_STEP):
+        tr = np.arange(0, max(0, t - MP_EMB))
+        te = np.arange(t, min(n, t + MP_STEP))
+        w = fixed if fixed is not None else _mp_weights(X, y, tr)[0]
+        pred[te] = _mp_score(X, w, te)
+        has = np.isfinite(X[tr]).any(axis=1)
+        if has.sum() >= MP_MIN_HIST:
+            ed = np.quantile(_mp_score(X, w, tr)[has], [0.2, 0.4, 0.6, 0.8])
+            qwf[te] = np.searchsorted(ed, pred[te], side='right')
+        for j in range(k):
+            if w[j] != 0:
+                tic = _mp_spear(X[te, j], y[te])
+                if np.isfinite(tic):
+                    stab_n[j] += 1
+                    stab_hit[j] += np.sign(tic) == np.sign(w[j])
+        folds.append(dict(start=str(idx[t])[:10], w=[round(float(x), 4) for x in w]))
+    ok = np.isfinite(pred) & np.isfinite(y) & np.isfinite(r)
+    m = dict(kind=kind, n_oos=int(ok.sum()), valid=False)
+    if ok.sum() < 250:
+        return m, qwf
+    p, yy, rr, d = pred[ok], y[ok], r[ok], dd[ok]
+    m['oos_start'] = str(np.asarray(idx)[ok][0])[:10]
+    m['oos_ic'] = round(_mp_spear(p, yy), 3)
+    edges = [float(x) for x in np.quantile(p, [0.2, 0.4, 0.6, 0.8])]
+    q = np.searchsorted(edges, p, side='right')
+    tbl = []
+    for g in range(5):
+        mm = q == g
+        tbl.append(dict(n=int(mm.sum()), ret=round(float(rr[mm].mean()), 2), up=round(float((rr[mm] > 0).mean() * 100), 1),
+                        dd5=round(float((d[mm] <= -5).mean() * 100), 1), mdd=round(float(d[mm].mean()), 2)))
+    key = 'ret' if kind == 'ret' else 'mdd'      # 報酬模型看平均報酬、風險模型看平均最大跌幅，都要由差到好
+    m['mono'] = round(_mp_spear(np.arange(5, dtype=float), np.array([x[key] for x in tbl]), 3), 2)
+    m['quint'], m['edges'] = tbl, edges
+    m['valid'] = bool(m['oos_ic'] >= 0.05 and m['mono'] >= 0.7)
+    wf, icf = _mp_weights(X, y, np.arange(0, n - MP_EMB))
+    if fixed is not None:
+        wf = fixed
+    m['fixed'] = fixed is not None
+    m['w'] = [round(float(x), 4) for x in wf]
+    m['ic'] = [None if not np.isfinite(x) else round(float(x), 3) for x in icf]
+    m['stab'] = [None if not stab_n[j] else round(float(stab_hit[j] / stab_n[j] * 100)) for j in range(k)]
+    m['nf'] = [int(x) for x in stab_n]
+    m['folds'] = folds
+    return m, qwf
+
+
+def mp_walkforward(F, c, market):
+    """F：特徵（index＝日期）；c：指數收盤 → 報告＋評分卡（報酬模型＋風險模型，dict 可直接存成 JSON）"""
+    cols = list(F.columns)
+    raw = F.values.astype(float)
+    X = np.column_stack([_mp_pct_expanding(raw[:, j]) for j in range(len(cols))])
+    r, dd = mp_targets(c)
+    n = len(r)
+    rep = dict(market=market, built=_ds(dt.date.today()), start=str(F.index[0])[:10], end=str(F.index[-1])[:10], cols=cols)
+    pri = np.array([float(MP_RISK_PRIOR.get(c_, 0)) for c_ in cols])
+    rep['models'], qw = {}, {}
+    for kd, _, _ in MP_MODELS:
+        rep['models'][kd], qw[kd] = _mp_model(X, (r if kd == 'ret' else dd), r, dd, n, F.index, kd, fixed=(pri if kd == 'risk' and pri.any() else None))
+    mr = rep['models']['ret']
+    rep['n_oos'] = mr['n_oos']
+    if mr['n_oos'] < 250:
+        rep['msg'] = f"樣本外天數只有 {mr['n_oos']} 天（需要 ≥250），歷史資料太短，無法驗證"
+        return rep
+    ok = np.isfinite(r) & (np.arange(n) >= MP_WARM)
+    rep['oos_start'] = mr['oos_start']
+    rep['base'] = dict(ret=round(float(r[ok].mean()), 2), up=round(float((r[ok] > 0).mean() * 100), 1),
+                       dd5=round(float((dd[ok] <= -5).mean() * 100), 1), mdd=round(float(dd[ok].mean()), 2))
+    mp_simulate(rep, F, c, qw)
+    rep['valid'] = rep.get('pick') is not None
+    rep['ref'] = [[round(float(v), 4) for v in np.sort(raw[:, j][np.isfinite(raw[:, j])])] for j in range(len(cols))]
+    rep['w'] = True   # 舊欄位相容：有評分卡
+    rep['now'] = mp_reading(rep, {cols[j]: raw[-1, j] for j in range(len(cols))}, str(F.index[-1])[:10])
+    return rep
+
+
+def _mp_metrics(pos, rd, mask):
+    p = np.where(np.isfinite(pos), pos, 1.0)[mask]
+    d = rd[mask] * p
+    if len(d) < 250:
+        return None
+    eq = np.cumprod(1 + d)
+    yrs = len(d) / 252
+    sd = d.std(ddof=1)
+    cagr = eq[-1] ** (1 / yrs) - 1
+    mdd = float((eq / np.maximum.accumulate(eq) - 1).min())
+    return dict(cagr=round(cagr * 100, 2), vol=round(sd * math.sqrt(252) * 100, 2), mdd=round(mdd * 100, 2),
+                sharpe=round(float(d.mean() / sd * math.sqrt(252)) if sd > 0 else 0.0, 2),
+                calmar=round(cagr / abs(mdd), 2) if mdd < 0 else None, avgpos=round(float(p.mean() * 100)))
+
+
+def mp_simulate(rep, F, c, qw):
+    """持股策略模擬（樣本外每天依當天收盤後的分級決定隔天持股，空手部位報酬算 0）：
+    兩個模型 × 兩種持股對照表、波動率目標法（持股＝過去波動率中位數÷目前波動率，30～100%）、永遠滿倉。
+    夏普值比永遠滿倉高 ≥0.05 且最大回撤較小的方式中，取夏普值最高的當建議；都沒有就不調整持股"""
+    cv = c.values.astype(float)
+    n = len(cv)
+    rd = np.full(n, np.nan)
+    rd[:-1] = cv[1:] / cv[:-1] - 1
+    mask = (np.arange(n) >= MP_WARM) & np.isfinite(rd)
+    rows = []
+    bh = _mp_metrics(np.ones(n), rd, mask)
+    if not bh:
+        return
+    rows.append(dict(name='永遠滿倉（對照）', kind='bh', **bh))
+    for kd, nm, _ in MP_MODELS:
+        q = qw.get(kd)
+        m = rep['models'].get(kd) or {}
+        if q is None or not m.get('quint'):
+            continue
+        for sn, sch in MP_SCHEMES.items():
+            pos = np.where(q >= 0, np.array(sch + [100])[np.clip(q, 0, 4)] / 100.0, np.nan)
+            mt = _mp_metrics(pos, rd, mask)
+            if mt:
+                rows.append(dict(name=f'{nm}・{sn}', kind='model', model=kd, scheme=sn, pos=sch, valid=bool(m.get('valid')), **mt))
+    if '60日波動率%' in F.columns:
+        v = F['60日波動率%'].values.astype(float)
+        med = pd.Series(v).expanding(min_periods=MP_MIN_HIST).median().values
+        pos = np.clip(med / v, 0.3, 1.0)
+        mt = _mp_metrics(pos, rd, mask)
+        if mt:
+            rows.append(dict(name=MP_VT_NAME, kind='vt', valid=True, **mt))
+        rep['vt_med'] = float(np.nanmedian(v))
+    rep['sim'] = rows
+    cand = [x for x in rows if x['kind'] != 'bh' and x.get('valid') and x['sharpe'] >= bh['sharpe'] + 0.05 and x['mdd'] > bh['mdd']]
+    best = max(cand, key=lambda x: x['sharpe']) if cand else None
+    rep['pick'] = None if not best else {k_: best.get(k_) for k_ in ('name', 'kind', 'model', 'scheme', 'pos', 'sharpe', 'mdd', 'cagr')}
+
+
+def _mp_read_model(m, pcts):
+    if not m.get('w'):
+        return None
+    z = sum(w * (pc - 0.5) for w, pc in zip(m['w'], pcts) if pc is not None)
+    tot = sum(abs(w) for w in m['w'])
+    s = z / tot * 2 if tot else 0.0
+    q = int(np.searchsorted(m['edges'], s, side='right'))
+    qt = m['quint'][q]
+    det = sorted([dict(i=j, contrib=round(w * (pc - 0.5), 4)) for j, (w, pc) in enumerate(zip(m['w'], pcts)) if pc is not None and w],
+                 key=lambda x: -abs(x['contrib']))
+    return dict(score=round(s, 3), q=q + 1, ret=qt['ret'], up=qt['up'], dd5=qt['dd5'], mdd=qt['mdd'], valid=m['valid'], oos_ic=m['oos_ic'], top=det[:3])
+
+
+def mp_reading(sc, vals, asof):
+    """用評分卡算「今天」：各指標在完整歷史的百分位 → 報酬模型／風險模型各自第幾級 → 建議持股（有效的模型取平均）"""
+    if not sc or not sc.get('models'):
+        return None
+    pcts, det = [], []
+    for j, nm in enumerate(sc['cols']):
+        v, ref = vals.get(nm), sc['ref'][j]
+        pc = (bisect.bisect_left(ref, v) / len(ref)) if (v is not None and np.isfinite(v) and len(ref) >= MP_MIN_HIST) else None
+        pcts.append(pc)
+        det.append(dict(name=nm, val=None if v is None or not np.isfinite(v) else round(float(v), 2), pct=None if pc is None else round(pc * 100)))
+    rd = {kd: _mp_read_model(sc['models'][kd], pcts) for kd, _, _ in MP_MODELS if sc['models'].get(kd)}
+    pk, pos = sc.get('pick'), None
+    if pk and pk.get('kind') == 'model' and rd.get(pk['model']):
+        pos = pk['pos'][rd[pk['model']]['q'] - 1]
+    elif pk and pk.get('kind') == 'vt' and sc.get('vt_med'):
+        vn = vals.get('60日波動率%')
+        if vn is not None and np.isfinite(vn) and vn > 0:
+            pos = int(round(min(1.0, max(0.3, sc['vt_med'] / vn)) * 100 / 5) * 5)
+    return dict(asof=asof, models=rd, pos=pos, valid=pos is not None, pick=pk['name'] if pk else None, det=det)
+
+
+def mp_build(token, years, log=None):
+    H = mp_fetch(token, years, log)
+    F, c = mp_features(H)
+    return mp_walkforward(F, c, MP_MARKET)
+
+
+def mp_save(rep):
+    try:
+        with open(MP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(rep, f, ensure_ascii=False)
+        return True
+    except Exception:  # noqa
+        return False
+
+
+def mp_load():
+    try:
+        with open(MP_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return None
+
+
+def mp_live(token, sc):
+    """批次分析時：抓近約1.7年的大盤指標，算今天的評分卡讀數（每批只算一次）"""
+    if not sc or not sc.get('models'):
+        return None
+    try:
+        F, c = mp_features(mp_fetch(token, 1.7))
+        return mp_reading(sc, {nm: (F[nm].iloc[-1] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[-1])[:10])
+    except Exception as ex:  # noqa
+        return dict(err=str(ex)[:150])
+
+
+def mp_guide_text(pred, ps0):
+    """大盤指引的建議持股行（評分卡持股策略模擬勝過永遠滿倉時）"""
+    rk = pred['models'].get('risk') or {}
+    return (f"・**建議持股 {pred['pos']}%（依大盤預測評分卡持股策略：{pred.get('pick')}；目前風險模型第 {rk.get('q', '--')}/5 級）**　"
+            + (f"風險模型：未來20日期間跌≥5% 機率 {rk['dd5']:.0f}%、平均最大跌幅 {rk['mdd']:.1f}%" if rk else '')
+            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）")
+
+
+def mp_panel_line(pr):
+    if not pr:
+        return None
+    if pr.get('err'):
+        return f"🔮 大盤預測評分卡：今天讀數抓取失敗（{pr.get('err')}）"
+    parts = []
+    for kd, nm, _ in MP_MODELS:
+        x = pr['models'].get(kd)
+        if not x:
+            continue
+        tag = f"✅IC {x['oos_ic']:+.2f}" if x['valid'] else f"⚠️未通過 IC {x['oos_ic']:+.2f}"
+        parts.append(f"{nm} **第 {x['q']}/5 級**（{tag}；樣本外歷史：未來20日平均 {x['ret']:+.2f}%、跌≥5% 機率 {x['dd5']:.0f}%）")
+    return (f"🔮 大盤預測評分卡（{pr['asof']}）：" + '　｜　'.join(parts)
+            + (f"　→ 持股策略：{pr['pick']}" if pr.get('pick') else '　→ 持股策略模擬沒有比永遠滿倉更好的方式，建議持股維持原規則'))
+
+
+def render_market_pred(st, ss, K):
+    st.subheader('🔮 大盤預測評分卡（walk-forward 樣本外驗證）')
+    st.caption('用 10 年以上的大盤層級指標（' + MP_DESC + '），每半年只用「當時以前」的資料重算各指標權重，預測下半年。'
+               '同時建兩個模型：**報酬模型**從資料學各指標權重、預測未來20日報酬；**風險模型**不學權重，依市場常識固定方向（波動率、VIX 高、跌破長期均線＝風險高）'
+               '預測未來20日期間最大跌幅（波動有群聚性，通常比報酬好預測），walk-forward 只用來驗證。'
+               '模型樣本外有效（IC≥0.05、五級表現由差到好單調）才可用；再做持股策略模擬（積極／溫和兩種對照表、波動率目標法），'
+               '夏普值勝過永遠滿倉且回撤較小的方式才拿來當建議持股，否則維持原本的溫度計＋K線規則。每次批次分析會多抓約' + MP_LIVE_COST + '的大盤資料。')
+    c1, c2 = st.columns([1, 2])
+    yrs = c1.slider('歷史年數', 8, 20, 15, key='mp_years')
+    if c2.button('🔮 執行大盤預測回測', type='primary', key='run_mp'):
+        tok = ss.get('token', '').strip()
+        if not tok:
+            st.error('請先輸入 API Key')
+        else:
+            try:
+                with st.spinner('抓取大盤歷史資料並做樣本外驗證中…'):
+                    rep = mp_build(tok, yrs)
+                ss['mp_rep'] = rep
+                if rep.get('models'):
+                    mp_save(rep)
+            except Exception as ex:  # noqa
+                st.error(f'❌ 大盤預測回測失敗：{ex}')
+    up_ = st.file_uploader('或載入先前下載的評分卡（.json；Streamlit Cloud 重新啟動後本機檔案會消失，可用這個還原）', type=['json'], key='mp_up')
+    if up_ is not None and ss.get('_mp_up_sig') != (up_.name, up_.size):
+        try:
+            ss['mp_rep'] = json.loads(up_.getvalue().decode('utf-8'))
+            ss['_mp_up_sig'] = (up_.name, up_.size)
+            if ss['mp_rep'].get('models'):
+                mp_save(ss['mp_rep'])
+        except Exception as ex:  # noqa
+            st.error(f'評分卡檔案讀取失敗：{ex}')
+    rep = ss.get('mp_rep') or mp_load()
+    if not rep or not rep.get('models'):
+        st.info('按「🔮 執行大盤預測回測」開始。' + ('（舊版評分卡格式，請重新執行）' if rep else ''))
+        return
+    st.download_button('💾 下載評分卡（.json）', json.dumps(rep, ensure_ascii=False).encode('utf-8'),
+                       file_name=f"大盤預測評分卡_{rep.get('market', '')}_{rep.get('built', '')}.json", key='mp_dl')
+    st.markdown(f"**資料期間** {rep['start']} ～ {rep['end']}　｜　樣本外 {rep.get('oos_start', '--')} 起共 {rep['n_oos']} 天　｜　建立於 {rep['built']}")
+    if rep.get('msg'):
+        st.warning(rep['msg'])
+        return
+    b = rep['base']
+    for kd, nm, tgt in MP_MODELS:
+        m = rep['models'].get(kd) or {}
+        if not m.get('quint'):
+            continue
+        st.markdown(f'#### {nm}（預測{tgt}' + ('，依市場常識固定方向、不擬合' if m.get('fixed') else '，權重每半年從資料重學') + '）')
+        (st.success if m['valid'] else st.warning)(
+            f"{'✅ 樣本外驗證有效' if m['valid'] else '⚠️ 樣本外驗證未通過'}：IC {m['oos_ic']:+.3f}、五級單調度 {m['mono']:+.2f}"
+            + ('（需要 IC≥0.05 且單調度≥0.7）→ 不採用' if not m['valid'] else ' → 可用，持股對照表看下方「持股策略模擬」'))
+        st.dataframe(pd.DataFrame([dict(級別=f'第{k + 1}級' + ('（最差）' if k == 0 else '（最好）' if k == 4 else ''), 天數=x['n'],
+                                        未來20日平均報酬=x['ret'], 上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 平均最大跌幅=x['mdd'],
+                                        建議持股=((rep['pick']['pos'][k] if rep.get('pick') and rep['pick'].get('model') == kd else '—') if m['valid'] else '不採用'))
+                                   for k, x in enumerate(m['quint'])]
+                                  + [dict(級別='全部（永遠持有）', 天數=rep['n_oos'], 未來20日平均報酬=b['ret'], 上漲機率=b['up'],
+                                          期間跌5以上機率=b['dd5'], 平均最大跌幅=b['mdd'], 建議持股='')]),
+                     hide_index=True, use_container_width=True)
+    if rep.get('sim'):
+        st.markdown('#### 持股策略模擬（樣本外每天依當天分級決定隔天持股；分級切點只用當時以前的資料；空手報酬算 0）')
+        pk = rep.get('pick')
+        (st.success if pk else st.warning)(
+            f"✅ 建議採用：**{pk['name']}**（夏普 {pk['sharpe']}、最大回撤 {pk['mdd']}%、年化 {pk['cagr']}%）→ 批次分析的建議持股改用這個方式" if pk else
+            '⚠️ 沒有任何方式的夏普值比永遠滿倉高 0.05 以上、同時回撤較小 → 建議持股維持原本的溫度計＋K線規則')
+        st.dataframe(pd.DataFrame([dict(方式=x['name'] + ('' if x.get('valid', True) else '（模型未通過）'), 年化報酬=x['cagr'], 年化波動=x['vol'], 最大回撤=x['mdd'],
+                                        夏普=x['sharpe'], 卡瑪=x['calmar'], 平均持股=x['avgpos']) for x in rep['sim']]),
+                     hide_index=True, use_container_width=True)
+    st.markdown('**各指標有效性**（IC＝全期間百分位跟目標的等級相關；權重0＝前後兩半不同方向或 |IC|<0.03；樣本外一致率＝有給權重的各半年裡，測試期 IC 跟訓練期同方向的比例）')
+    rows = []
+    for j, nm in enumerate(rep['cols']):
+        o = dict(指標=nm)
+        for kd, mn, _ in MP_MODELS:
+            m = rep['models'].get(kd) or {}
+            if m.get('w'):
+                o[f'{mn}IC'] = m['ic'][j]
+                o[f'{mn}權重'] = m['w'][j]
+                o[f'{mn}一致率'] = f"{m['stab'][j]}%（{m['nf'][j]}段）" if m['stab'][j] is not None else '—'
+        rows.append(o)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    now = rep.get('now')
+    if now:
+        st.markdown(mp_panel_line(now))
+        if now.get('pos') is not None:
+            st.markdown(mp_guide_text(now, None).replace('（原本溫度計＋K線規則為 --%）', ''))
+        st.dataframe(pd.DataFrame([dict(指標=d['name'], 目前數值=d['val'], 歷史百分位=d['pct']) for d in now['det']]),
+                     hide_index=True, use_container_width=True)
 
 
 def summary_frame(results, extras_flags, K, live=None):
@@ -3772,6 +4323,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
             except Exception:  # noqa
                 ehist = []
             tech.update(earnings_feats(bl, bl.n - 1, ehist))
+            tech.update(risk_feats(bl, bl.n - 1, bm))
             extras = dict(realtime=rt, peRange=None, peRangeErr=None, revRange=None, priceYoYRange=None,
                           sector=None, sectorBenchmark=None, tech=tech)
             extras['earnings'] = (earn_cal or {}).get(to_fmp_symbol(sid).upper()) or next_earnings_from_hist(ehist)
@@ -3820,7 +4372,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
             if ex_flags.get('sector'):
                 try:
                     extras['sector'] = fetch_profile(sid, token).get('sector')
-                    extras['sectorBenchmark'] = get_sector_benchmark(token, days, extras['sector'])
+                    extras['sectorBenchmark'] = get_sector_benchmark(token, max(days, LONG_HISTORY_DAYS), extras['sector'])   # 類股動能要約7個月
                 except Exception:  # noqa
                     pass
             r = analyze_stock(sid, fetch_name(sid, token, names), rows, bm, vpp, extras)
@@ -3834,7 +4386,10 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
             time.sleep(delay)
     results.sort(key=lambda r: -r['total'])
     _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
+    _sc = mp_load()
+    _mpr = mp_live(token, _sc) if _sc and _sc.get('w') else None
     for r in results:
+        r['mkt_pred'] = _mpr
         r['bm_close'] = _bmc
         r['vix'] = vx_live   # 大盤K線位置用（同一份清單，不重複佔記憶體）
     ensure_flagsets(results)
@@ -4168,7 +4723,7 @@ def run_daily(argv):
     if _reg:
         print(regime_banner(_reg).replace('**', ''))
     _ml, _mt, _kp = market_panel_lines(results, K)
-    for _ln in _ml + ['📋 大盤指引'] + market_guide_lines(_mt, _kp):
+    for _ln in _ml + ['📋 大盤指引'] + market_guide_lines(_mt, _kp, next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None)):
         print(_ln.replace('**', ''))
     recs = hit_records(results, K)
     added = append_hit_log(recs)
@@ -4233,7 +4788,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-20b 評等／內部人／股數／VIX'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-22f 價格風險因子'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4518,13 +5073,15 @@ def main():
                 ss['bt_loaded_name'] = None
                 det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔")
 
-    tab_batch, tab_track, tab_bt = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測'])
+    tab_batch, tab_track, tab_bt, tab_mp = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測', '🔮 大盤預測'])
     with tab_batch:
         render_batch(st, ss, K)
     with tab_track:
         render_tracking(st, ss, K)
     with tab_bt:
         render_backtest(st, ss, K)
+    with tab_mp:
+        render_market_pred(st, ss, K)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -4562,7 +5119,7 @@ def render_batch(st, ss, K):
     _ml, _mt, _kp = market_panel_lines(results, K)
     (st.success if _ml[-1].startswith('🟢') else st.error if _ml[-1].startswith('🔴') else st.info)('\n\n'.join(_ml))
     with st.expander('📋 大盤指引（白話解讀與觀察重點）', expanded=True):
-        st.markdown('\n\n'.join(market_guide_lines(_mt, _kp)))
+        st.markdown('\n\n'.join(market_guide_lines(_mt, _kp, next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))))
     if '組合型態' in df.columns and len(df):
         _bc = st.columns(len(STYLE_LISTS))
         for (_sty, _ln), _c in zip(STYLE_LISTS, _bc):
