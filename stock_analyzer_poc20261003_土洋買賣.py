@@ -2688,7 +2688,8 @@ def load_bt_files(files):
     return store_bt_df(df)
 
 
-BT_SEG_OPTIONS = ['自訂月數', '三年分三段・第1段（最近1年）', '三年分三段・第2段（1～2年前）', '三年分三段・第3段（2～3年前）']
+BT_SEG_MONTHS = 6   # 三年分六段：每段半年（一年一段資料量大，加上進階籌碼後容易超過 Streamlit Cloud 記憶體）
+BT_SEG_OPTIONS = ['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
 
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
                  delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False, include_chip2=False):
@@ -4566,7 +4567,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-23 類股欄位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-25 台股回測分六段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4675,14 +4676,14 @@ def main():
         st.markdown('**🔬 歷史回測分析**')
         bt_univ = st.selectbox('回測股票池', ['上市清單', '上櫃清單', '上市+上櫃', '目前輸入框清單'], key='bt_univ')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
-                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分三次：每次跑一年，各自下載原始紀錄檔，最後三個檔一起載入合併分析')
+                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析')
         if bt_seg == BT_SEG_OPTIONS[0]:
             bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
             bt_off = 0
         else:
-            bt_months, bt_off = 12, (BT_SEG_OPTIONS.index(bt_seg) - 1) * 12
-            st.caption(f'本次評估區間：{bt_off}～{bt_off + 12} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
-                       '三段都下載後，三個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋會自動逐段（第1／2／3段）驗證。')
+            bt_months, bt_off = BT_SEG_MONTHS, (BT_SEG_OPTIONS.index(bt_seg) - 1) * BT_SEG_MONTHS
+            st.caption(f'本次評估區間：{bt_off}～{bt_off + BT_SEG_MONTHS} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
+                       '六段都下載後，六個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋仍依評估日切成三段（每年一段）驗證。')
         bt_div = st.checkbox('📈 近3月YoY乖離度（股價歷史要抓超過1年）', key='bt_div')
         bt_inst = st.checkbox('🏦 三大法人買賣超（近3月）', key='bt_inst')
         bt_pe = st.checkbox('📐 本益比／淨值比位階、殖利率（P/E、P/B 近3年百分位；每檔多1次API）', value=True, key='bt_pe')
@@ -4691,7 +4692,7 @@ def main():
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
         bt_delay = st.number_input('回測每檔間隔秒數', 0.0, 5.0, 0.3, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
-        ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如三段各一個）',
+        ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如六段各一個）',
                                type=['csv', 'gz'], accept_multiple_files=True)
         up_sig = tuple(sorted((u.name, u.size) for u in ups)) if ups else None
         if up_sig and ss.get('bt_loaded_name') != up_sig:
