@@ -1214,6 +1214,8 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     row['inst3m'] = ex.get('inst3m')
     row['pe'] = ex.get('pe')
     row['pePct'] = ex.get('pePct')
+    for k in CHIP2_KEYS:
+        row[k] = ex.get(k)
     row['trust5'] = ex.get('trust5')
     row['foreign5'] = ex.get('foreign5')
     row['trustStreak3'] = ex.get('trustStreak3')
@@ -1384,6 +1386,42 @@ def build_condition_flags(df: pd.DataFrame):
         F['月營收連3月年增'] = eq1('revYoy3Pos')
     if has('revHigh24'):
         F['月營收創24個月新高'] = eq1('revHigh24')
+    # 2026-10-22 新增：P/B、殖利率、進階籌碼、大盤期現貨籌碼（待回測驗證）
+    if has('pbPct'):
+        F['P/B近3年低檔(≤20%)'] = _col(df, 'pbPct').le(20)
+        F['P/B近3年高檔(≥80%)'] = _col(df, 'pbPct').ge(80)
+    if has('pb'):
+        F['P/B<1倍'] = _col(df, 'pb').gt(0) & _col(df, 'pb').lt(1)
+    if has('dy'):
+        F['殖利率≥5%'] = _col(df, 'dy').ge(5)
+    if has('mgChg20'):
+        F['融資近20日增加≥20%'] = _col(df, 'mgChg20').ge(20)
+        F['融資近20日減少≥20%'] = _col(df, 'mgChg20').le(-20)
+    if has('ssRatio'):
+        F['券資比≥30%'] = _col(df, 'ssRatio').ge(30)
+    if has('mgUse'):
+        F['融資使用率≥30%'] = _col(df, 'mgUse').ge(30)
+    if has('mgDownPxUp'):
+        F['融資減少但股價上漲(近20日)'] = eq1('mgDownPxUp')
+    if has('fhChg20'):
+        F['外資持股比例近20日增加≥1%'] = _col(df, 'fhChg20').ge(1)
+        F['外資持股比例近20日減少≥1%'] = _col(df, 'fhChg20').le(-1)
+    if has('fhHigh250'):
+        F['外資持股比例創一年新高'] = eq1('fhHigh250')
+    if has('bigChg4w'):
+        F['千張大戶持股近4週增加≥1%'] = _col(df, 'bigChg4w').ge(1)
+        F['千張大戶持股近4週減少≥1%'] = _col(df, 'bigChg4w').le(-1)
+    if has('pplChg4w'):
+        F['股東人數近4週減少≥3%(籌碼集中)'] = _col(df, 'pplChg4w').le(-3)
+    if has('sblChg20'):
+        F['借券賣出餘額近20日增加≥30%'] = _col(df, 'sblChg20').ge(30)
+        F['借券賣出餘額近20日減少≥30%'] = _col(df, 'sblChg20').le(-30)
+    if has('fxOI'):
+        F['外資台指期淨空單≥2萬口'] = _col(df, 'fxOI').le(-20000)
+        F['外資台指期淨多單'] = _col(df, 'fxOI').gt(0)
+    if has('mktMgChg20'):
+        F['整體融資近20日增加≥8%'] = _col(df, 'mktMgChg20').ge(8)
+        F['整體融資近20日減少≥8%'] = _col(df, 'mktMgChg20').le(-8)
     # 2026-10-20 新增：本益比位階（TaiwanStockPER；百分位＝目前P/E在自己近3年的位置，待回測驗證）
     if has('pePct'):
         F['P/E近3年低檔(≤20%)'] = _col(df, 'pePct').le(20)
@@ -1712,7 +1750,8 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
 # 擇時型因子：這些條件本身描述的是「大盤／整體位置」，含這些條件的高勝率組合，勝率多半來自
 # 「出現在大盤反彈的日子」（2026-09-27 台股回測：扣掉同日大盤後超額報酬≈0），
 # 適合拿來判斷大盤是否落底，不適合當選股依據。
-TIMING_FACTORS = {'布林通道低檔(≤20%)', '大盤跌破20日均線', '大盤跌破60日均線', '類股跌破20日均線', '類股跌破60日均線'}
+TIMING_FACTORS = {'布林通道低檔(≤20%)', '大盤跌破20日均線', '大盤跌破60日均線', '類股跌破20日均線', '類股跌破60日均線',
+                  '外資台指期淨空單≥2萬口', '外資台指期淨多單', '整體融資近20日增加≥8%', '整體融資近20日減少≥8%'}
 
 
 def is_timing_combo(combo):
@@ -1858,6 +1897,27 @@ def fetch_benchmark(token, days, bid='0050'):
     return Benchmark([dict(date=r['date'], close=r['close']) for r in rows])
 
 
+IND_GENERIC = {'電子工業', 'ETF', 'Index', '大盤', '所有證券', '存託憑證', '受益證券', '上櫃指數股票型基金(ETF)', '指數投資證券(ETN)'}
+
+
+def fetch_stock_info(token):
+    """TaiwanStockInfo → (名稱對照, 產業類別對照)；同一檔有多個類別時取最具體的（不取「電子工業」這種總稱）"""
+    try:
+        j = api_get(dict(dataset='TaiwanStockInfo'), token)
+    except Exception:  # noqa
+        return {}, {}
+    names, inds = {}, {}
+    for d in j.get('data') or []:
+        sid = d.get('stock_id')
+        if not sid:
+            continue
+        names.setdefault(sid, d.get('stock_name') or sid)
+        cat = str(d.get('industry_category') or '').strip()
+        if cat and (sid not in inds or (inds[sid] in IND_GENERIC and cat not in IND_GENERIC)):
+            inds[sid] = cat
+    return names, inds
+
+
 def fetch_name_map(token):
     try:
         j = api_get(dict(dataset='TaiwanStockInfo'), token)
@@ -1891,7 +1951,23 @@ def fetch_pe_range(sid, token, years=3):
     if not math.isfinite(cur) or cur <= 0:
         cur = vals[-1]
     pct = pe_pct_of(raw, vals)
-    return dict(min=min(vals), max=max(vals), current=cur, raw=raw, pct=pct)
+    out = dict(min=min(vals), max=max(vals), current=cur, raw=raw, pct=pct)
+    # 同一筆 TaiwanStockPER 也有 PBR、dividend_yield（不多花 API）
+    pbs = [_fnum(r.get('PBR')) for r in rows]
+    pbv = [x for x in pbs if x is not None and x > 0]
+    pb = pbs[-1] if pbs and pbs[-1] is not None and pbs[-1] > 0 else None
+    out['pb'] = pb
+    out['pbPct'] = pe_pct_of(pb, pbv)
+    out['dy'] = _fnum(rows[-1].get('dividend_yield'))
+    return out
+
+
+def _fnum(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except Exception:  # noqa
+        return None
 
 
 PE_MIN_HIST = 250   # 近3年至少要有 250 個交易日的有效 P/E 才算百分位
@@ -1920,6 +1996,182 @@ def fetch_per_hist(sid, token, days_back):
             d.append(ds)
             v.append(x)
     return d, np.array(v, dtype=float)
+
+
+def fetch_val_hist(sid, token, days_back):
+    """回測用：每日 PER／PBR／殖利率 → (dates, per, pbr, dy)（同一次 TaiwanStockPER 查詢）"""
+    end = dt.date.today()
+    j = api_get(dict(dataset='TaiwanStockPER', data_id=sid,
+                     start_date=_ds(end - dt.timedelta(days=days_back)), end_date=_ds(end)), token)
+    rows = sorted((r for r in (j.get('data') or []) if r.get('date')), key=lambda r: str(r['date'])[:10])
+    d, pe, pb, dy = [], [], [], []
+    for r in rows:
+        x = _fnum(r.get('PER'))
+        if x is None:
+            continue
+        d.append(str(r['date'])[:10])
+        pe.append(x)
+        y = _fnum(r.get('PBR'))
+        pb.append(y if y is not None else np.nan)
+        z = _fnum(r.get('dividend_yield'))
+        dy.append(z if z is not None else np.nan)
+    return d, np.array(pe, dtype=float), np.array(pb, dtype=float), np.array(dy, dtype=float)
+
+
+def val_asof(vh, ds):
+    """回測：P/E、P/B 與各自近3年百分位、殖利率（評估日當天含以前最新一筆）"""
+    d, pe, pb, dy = vh
+    out = pe_asof((d, pe), ds)
+    b_ = pe_asof((d, np.nan_to_num(pb, nan=-1.0)), ds)
+    out['pb'] = b_['pe'] if b_['pe'] is not None and b_['pe'] > 0 else None
+    out['pbPct'] = b_['pePct']
+    i = bisect.bisect_right(d, ds) - 1
+    out['dy'] = float(dy[i]) if (out['pe'] is not None and i >= 0 and np.isfinite(dy[i])) else None
+    return out
+
+
+# ── 2026-10-22 台股新增：進階籌碼（融資融券、外資持股、千張大戶、借券賣出）＋大盤期現貨籌碼 ──
+#    籌碼資料多半在當天收盤後才公布，一律只用評估日「前一個」交易日（含）以前的資料，批次與回測一致
+CHIP2_KEYS = ('pb', 'pbPct', 'dy', 'mgChg20', 'ssRatio', 'mgUse', 'mgDownPxUp', 'fhChg20', 'fhHigh250',
+              'bigChg4w', 'pplChg4w', 'sblChg20', 'fxOI', 'mktMgChg20')
+
+
+def _daily_series(dataset, sid, token, days_back, cols, filt=None, extra=None):
+    end = dt.date.today()
+    p = dict(dataset=dataset, start_date=_ds(end - dt.timedelta(days=days_back)), end_date=_ds(end))
+    if sid:
+        p['data_id'] = sid
+    p.update(extra or {})
+    j = api_get(p, token)
+    agg = {}
+    for r in j.get('data') or []:
+        if filt and not filt(r):
+            continue
+        dd = str(r.get('date', ''))[:10]
+        if len(dd) < 10:
+            continue
+        a = agg.setdefault(dd, [0.0] * len(cols))
+        for k, c in enumerate(cols):
+            v = c(r) if callable(c) else _fnum(r.get(c))
+            if v is not None:
+                a[k] += v
+    ds_ = sorted(agg)
+    return ds_, [np.array([agg[x][k] for x in ds_], dtype=float) for k in range(len(cols))]
+
+
+def fetch_margin_hist(sid, token, days_back):
+    return _daily_series('TaiwanStockMarginPurchaseShortSale', sid, token, days_back,
+                         ['MarginPurchaseTodayBalance', 'MarginPurchaseLimit', 'ShortSaleTodayBalance'])
+
+
+def fetch_fh_hist(sid, token, days_back):
+    return _daily_series('TaiwanStockShareholding', sid, token, days_back, ['ForeignInvestmentSharesRatio'])
+
+
+def _is_big_level(r):
+    lv = str(r.get('HoldingSharesLevel') or '').lower().replace(' ', '')
+    return 'morethan1,000,001' in lv or lv.startswith('1,000,001')
+
+
+def fetch_holding_hist(sid, token, days_back):
+    """股權持股分級（每週）：千張大戶（持股＞100萬股）持股比例%、總股東人數"""
+    return _daily_series('TaiwanStockHoldingSharesPer', sid, token, days_back,
+                         [lambda r: _fnum(r.get('percent')) if _is_big_level(r) else None,
+                          lambda r: _fnum(r.get('people')) if 'total' in str(r.get('HoldingSharesLevel') or '').lower() else None])
+
+
+def fetch_sbl_hist(sid, token, days_back):
+    return _daily_series('TaiwanDailyShortSaleBalances', sid, token, days_back, ['SBLShortSalesCurrentDayBalance'])
+
+
+def fetch_fut_foreign_oi(token, days_back):
+    """台指期（TX）外資淨未平倉口數＝多方未平倉−空方未平倉"""
+    return _daily_series('TaiwanFuturesInstitutionalInvestors', 'TX', token, days_back,
+                         [lambda r: (_fnum(r.get('long_open_interest_balance_volume')) or 0) - (_fnum(r.get('short_open_interest_balance_volume')) or 0)],
+                         filt=lambda r: '外資' in str(r.get('institutional_investors') or '') or 'Foreign' in str(r.get('institutional_investors') or ''))
+
+
+def fetch_total_margin(token, days_back):
+    """整體市場融資餘額（金額）"""
+    return _daily_series('TaiwanStockTotalMarginPurchaseShortSale', None, token, days_back, ['TodayBalance'],
+                         filt=lambda r: str(r.get('name') or '') == 'MarginPurchaseMoney')
+
+
+def _prev_idx(dates, ds):
+    """評估日之前（不含當天）最新一筆的位置"""
+    return bisect.bisect_left(dates, ds) - 1 if dates else -1
+
+
+def chip2_feats(b, e, H):
+    """H：{'margin','fh','hold','sbl'} → 進階籌碼特徵（只用評估日前一天以前的資料）；沒抓的資料對應特徵為 None"""
+    ds = b.date[e]
+    out = {k: None for k in ('mgChg20', 'ssRatio', 'mgUse', 'mgDownPxUp', 'fhChg20', 'fhHigh250', 'bigChg4w', 'pplChg4w', 'sblChg20')}
+    m = H.get('margin')
+    if m and m[0]:
+        i = _prev_idx(m[0], ds)
+        mg, lim, ss = m[1]
+        if i >= 20 and mg[i - 20] >= 100:
+            out['mgChg20'] = (mg[i] / mg[i - 20] - 1) * 100
+            if e >= 20 and b.close[e - 20]:
+                out['mgDownPxUp'] = int(out['mgChg20'] <= -10 and b.close[e] > b.close[e - 20])
+        if i >= 0 and mg[i] >= 100:
+            out['ssRatio'] = ss[i] / mg[i] * 100
+        if i >= 0 and lim[i] > 0:
+            out['mgUse'] = mg[i] / lim[i] * 100
+    f = H.get('fh')
+    if f and f[0]:
+        i = _prev_idx(f[0], ds)
+        r_ = f[1][0]
+        if i >= 20:
+            out['fhChg20'] = r_[i] - r_[i - 20]
+        if i >= 200:
+            out['fhHigh250'] = int(r_[i] >= r_[max(0, i - 250):i].max() and r_[i] > 0)
+    h = H.get('hold')
+    if h and h[0]:
+        i = _prev_idx(h[0], ds)
+        big, ppl = h[1]
+        if i >= 4:
+            out['bigChg4w'] = big[i] - big[i - 4]
+            if ppl[i - 4] > 0:
+                out['pplChg4w'] = (ppl[i] / ppl[i - 4] - 1) * 100
+    sb = H.get('sbl')
+    if sb and sb[0]:
+        i = _prev_idx(sb[0], ds)
+        v = sb[1][0]
+        if i >= 20 and v[i - 20] > 0:
+            out['sblChg20'] = max(-100.0, min(500.0, (v[i] / v[i - 20] - 1) * 100))
+    return out
+
+
+def mkt_chip_feats(ds, M):
+    """大盤期現貨籌碼：fxOI＝外資台指期淨未平倉口數；mktMgChg20＝整體融資餘額近20日變化%"""
+    out = {'fxOI': None, 'mktMgChg20': None}
+    if not M:
+        return out
+    fo = M.get('fut')
+    if fo and fo[0]:
+        i = _prev_idx(fo[0], ds)
+        if i >= 0:
+            out['fxOI'] = float(fo[1][0][i])
+    tm = M.get('tmg')
+    if tm and tm[0]:
+        i = _prev_idx(tm[0], ds)
+        v = tm[1][0]
+        if i >= 20 and v[i - 20] > 0:
+            out['mktMgChg20'] = (v[i] / v[i - 20] - 1) * 100
+    return out
+
+
+def fetch_mkt_chip(token, days_back):
+    M = {}
+    for k, fn_ in (('fut', fetch_fut_foreign_oi), ('tmg', fetch_total_margin)):
+        try:
+            M[k] = fn_(token, days_back)
+        except FinMindQuotaError:
+            raise
+        except Exception:  # noqa
+            M[k] = None
+    return M
 
 
 def pe_asof(pe_hist, ds):
@@ -2439,7 +2691,7 @@ def load_bt_files(files):
 BT_SEG_OPTIONS = ['自訂月數', '三年分三段・第1段（最近1年）', '三年分三段・第2段（1～2年前）', '三年分三段・第3段（2～3年前）']
 
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
-                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False):
+                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False, include_chip2=False):
     """FinMind 每小時額度用完時（HTTP 402）不會把剩下的股票全部記成失敗，而是暫停等待、額度恢復後從同一檔繼續；
     最多等 max_quota_wait 秒。前 40 檔全部因同一個原因失敗（Token 錯誤、連線不到）會提早停止。"""
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
@@ -2449,6 +2701,8 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     rev_days = (months_back + off) * 30 + 800   # 營收創24個月新高需要多兩年的月營收
     inst_days = (months_back + off) * 30 + 100
     pe_days = (months_back + off) * 30 + 1095 + 20   # 本益比百分位要往前看3年
+    chip_days = (months_back + off) * 30 + 400           # 進階籌碼：20日變化、一年新高
+    chip_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('margin', 'fh', 'hold', 'sbl')}
     win_start = _ds(dt.date.today() - dt.timedelta(days=(months_back + off) * 30))
     win_end = _ds(dt.date.today() - dt.timedelta(days=off * 30)) if off else None
     fail_reasons = {}
@@ -2484,12 +2738,14 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     try:
         name_map = with_quota_wait(lambda: fetch_name_map(token), 0, None)
         bm = with_quota_wait(lambda: fetch_benchmark(token, price_days), 0, None)
+        mkt_chip = with_quota_wait(lambda: fetch_mkt_chip(token, chip_days), 0, None)   # 大盤期現貨籌碼：整次只抓一次
     except FinMindQuotaError as qe:
         return pd.DataFrame(), dict(saved=0, failed=0, total=total, top_fail=[str(qe)],
                                     stopped=f'{qe}，等了 {max_quota_wait // 60} 分鐘仍未恢復')
     except Exception:  # noqa
         name_map = name_map if 'name_map' in locals() else {}
-        bm = None
+        bm = None if 'bm' not in locals() else bm
+        mkt_chip = {}
 
     def one(sid):
         rows = fetch_price(sid, token, price_days)
@@ -2514,14 +2770,30 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                 raise
             except Exception:  # noqa
                 inst, trust, foreign = {}, {}, {}
-        pe_hist = ([], None)
+        vh = None
         if include_pe:
             try:
-                pe_hist = fetch_per_hist(sid, token, pe_days)
+                vh = fetch_val_hist(sid, token, pe_days)
             except FinMindQuotaError:
                 raise
             except Exception:  # noqa
-                pe_hist = ([], None)
+                vh = None
+        CH = {}
+        if include_chip2:   # 融資融券／外資持股／千張大戶／借券賣出：各自前20檔全部失敗（方案不支援）就停止抓
+            for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist), ('hold', fetch_holding_hist), ('sbl', fetch_sbl_hist)):
+                st_ = chip_state[k_]
+                if st_['off']:
+                    continue
+                try:
+                    CH[k_] = fn_(sid, token, chip_days)
+                    st_['ok'] += 1
+                except FinMindQuotaError:
+                    raise
+                except Exception as ex_:  # noqa
+                    st_['fail'] += 1
+                    st_['err'] = str(ex_)[:150]
+                    if st_['ok'] == 0 and st_['fail'] >= 20:
+                        st_['off'] = True
         pc = PatternCache(b)
         recs = []
         for e in range(buf, ev_end):
@@ -2540,8 +2812,11 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
             if include_inst:
                 ex['inst3m'] = inst3m_asof(inst, ds)
                 ex.update(inst_flow_asof(inst, trust, foreign, b.date, e))
-            if include_pe:
-                ex.update(pe_asof(pe_hist, ds))
+            if include_pe and vh is not None:
+                ex.update(val_asof(vh, ds))
+            if CH:
+                ex.update(chip2_feats(b, e, CH))
+            ex.update(mkt_chip_feats(ds, mkt_chip))
             row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
             ec = b.close[e]
             row['entryClose'] = ec
@@ -2588,8 +2863,14 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     if len(df):
         df['evalDate'] = df['evalDate'].astype(str)
     top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:3]
+    nm_ = dict(margin='融資融券', fh='外資持股', hold='股權分級(千張大戶)', sbl='借券賣出')
+    chip_err = '；'.join(f"{nm_[k]} {v['fail']} 檔抓取失敗" + ('（前20檔全部失敗已停止，可能方案不支援）' if v['off'] else '') + f"：{v['err']}"
+                         for k, v in chip_state.items() if include_chip2 and v['fail']) or None
+    mk = locals().get('mkt_chip') or {}
+    mkt_err = '、'.join(n_ for k, n_ in (('fut', '期貨外資未平倉'), ('tmg', '整體融資')) if not mk.get(k)) or None
     return df, dict(saved=saved, failed=failed, total=total, top_fail=[f'{k}（{v}檔）' for k, v in top],
-                    stopped=stopped, quota_wait_min=int(state['waited'] // 60))
+                    stopped=stopped, quota_wait_min=int(state['waited'] // 60), chip_err=chip_err,
+                    mkt_err=(mkt_err + ' 抓不到，對應的大盤籌碼條件這次不會出現') if mkt_err else None)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2620,6 +2901,8 @@ def analyze_stock(sid, name, rows, bm, vp_params, extras_data):
     pr = extras_data.get('peRange')
     if pr:
         ex['pe'], ex['pePct'] = pr.get('raw'), pr.get('pct')
+        ex['pb'], ex['pbPct'], ex['dy'] = pr.get('pb'), pr.get('pbPct'), pr.get('dy')
+    ex.update(extras_data.get('chip2') or {})
     pc = PatternCache(b)
     row, info = build_flag_row(b, e, bm, pc, vp_params, ex)
     return dict(stockId=sid, name=name, bars=b, row=row, info=info, total=info['dm']['score'], **extras_data)
@@ -2834,6 +3117,17 @@ def market_panel_lines(results, K):
         lines.append(f"🌡️ 大盤溫度計：這次只分析 {mt['n']} 檔，少於 {MKT_MIN_STOCKS} 檔無法代表全市場（請用全市場／S&P500 等大清單）")
     if kp:
         lines.append(f"📉 大盤K線位置：**{kp['zone']}**（距60日高 {kp['dd60']:+.1f}%、RSI {kp['rsi']:.0f}、均線{kp['ma']}）→ {_zone_hist('KLINE', kp['zone'])}")
+    mc = next((r.get('mkt_chip') for r in results if r.get('mkt_chip')), None)
+    if mc and (mc.get('fxOI') is not None or mc.get('mktMgChg20') is not None):
+        t_ = []
+        if mc.get('fxOI') is not None:
+            t_.append(f"外資台指期淨{'多' if mc['fxOI'] > 0 else '空'}單 **{abs(mc['fxOI']):,.0f} 口**")
+        if mc.get('mktMgChg20') is not None:
+            t_.append(f"整體融資近20日 **{mc['mktMgChg20']:+.1f}%**")
+        lines.append('📊 期現貨籌碼：' + '、'.join(t_) + '（外資淨空單≥2萬口、融資20日±8% 已加入回測條件，待驗證後再納入建議持股）')
+    _mpl = mp_panel_line(next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))
+    if _mpl:
+        lines.append(_mpl)
     hot = (mt['zone'] in ('偏熱', '過熱')) + (kp is not None and kp['zone'] == '過熱')
     cold = (mt['zone'] in ('極冷', '偏冷')) + (kp is not None and kp['zone'] == '超賣')
     if cold == 2:
@@ -2864,10 +3158,14 @@ def market_position(mt, kp):
     return pct, act, sc, '、'.join(parts)
 
 
-def market_guide_lines(mt, kp):
-    """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）"""
+def market_guide_lines(mt, kp, pred=None):
+    """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）；
+    大盤預測評分卡樣本外驗證有效時，建議持股改用評分卡"""
     out = []
     ps = market_position(mt, kp)
+    if pred and not pred.get('err') and pred.get('valid') and pred.get('models'):
+        out.append(mp_guide_text(pred, ps[0] if ps else None))
+        ps = None
     if ps:
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
                    + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
@@ -2925,6 +3223,476 @@ def market_guide_lines(mt, kp):
     return out
 
 
+# ── 大盤預測評分卡：台股的大盤指標（籌碼類收盤後才公布 → 一律用前一個交易日）──
+MP_FILE_NAME = 'market_scorecard_tw.json'
+MP_MARKET = '台股'
+MP_DESC = '加權指數位置與動能、外資台指期未平倉、整體融資、外資現貨買賣超、新台幣匯率'
+MP_LIVE_COST = '5 次 API'
+
+
+def mp_fetch(token, years, log=None):
+    days = int(years * 365.25)
+    H = {'idx': fetch_price('TAIEX', token, days)}
+    jobs = (('fut', lambda: fetch_fut_foreign_oi(token, days)),
+            ('tmg', lambda: fetch_total_margin(token, days)),
+            ('fx', lambda: _daily_series('TaiwanExchangeRate', 'USD', token, days, ['spot_buy'],
+                                         filt=lambda r: (_fnum(r.get('spot_buy')) or 0) > 0)),
+            ('fi', lambda: _daily_series('TaiwanStockTotalInstitutionalInvestors', None, token, days,
+                                         [lambda r: (_fnum(r.get('buy')) or 0) - (_fnum(r.get('sell')) or 0)],
+                                         filt=lambda r: 'Foreign' in str(r.get('name') or '') or '外資' in str(r.get('name') or ''))))
+    for k, fn_ in jobs:
+        try:
+            H[k] = fn_()
+        except FinMindQuotaError:
+            raise
+        except Exception:  # noqa
+            H[k] = None
+    return H
+
+
+def mp_features(H):
+    F, c = mp_price_feats([r['date'] for r in H['idx']], [r['close'] for r in H['idx']])
+    ok = lambda k: H.get(k) and H[k][0]
+    if ok('fut'):
+        v = mp_align(F.index, H['fut'][0], H['fut'][1][0], lag=1)
+        F['外資台指期淨未平倉(口)'] = v
+        F['外資台指期近20日變化(口)'] = v - v.shift(20)
+    if ok('tmg'):
+        v = mp_align(F.index, H['tmg'][0], H['tmg'][1][0], lag=1)
+        F['整體融資近20日變化%'] = (v / v.shift(20) - 1) * 100
+        F['整體融資偏離一年均值%'] = (v / v.rolling(250, min_periods=200).mean() - 1) * 100
+    if ok('fx'):
+        v = mp_align(F.index, H['fx'][0], H['fx'][1][0], lag=1)
+        F['美元兌台幣近20日變化%'] = (v / v.shift(20) - 1) * 100
+    if ok('fi'):
+        v = pd.Series(H['fi'][1][0], index=H['fi'][0]).rolling(20, min_periods=15).sum() / 1e8
+        F['外資現貨近20日買賣超(億)'] = mp_align(F.index, list(v.index), v.values, lag=1)
+    return F, c
+
+
+# ════════════════════════════════════════════════════════════════════
+#  🔮 大盤預測評分卡（2026-10-22）：用 10 年以上的大盤層級指標，逐段往前推（walk-forward）做樣本外驗證
+#  每個指標轉成「在自己過去分布裡的百分位」；每半年用「到當時為止」的資料重算各指標跟未來20日報酬的
+#  等級相關（IC），前後兩半都同方向且 |IC|≥0.03 才給權重；訓練期最後 20 天不用（避免標籤偷看測試期）。
+#  分數＝Σ 權重×(百分位−0.5)，−1～+1；樣本外依分數分五級，看各級之後20日的實際表現，
+#  五級表現單調（等級相關≥0.7）且樣本外 IC≥0.05 才算有效 → 建議持股改用評分卡
+# ════════════════════════════════════════════════════════════════════
+MP_WARM = 750      # 前約3年只當訓練，不出預測
+MP_STEP = 126      # 每半年重訓一次
+MP_EMB = 20        # 訓練期最後20天不用
+MP_MIN_IC = 0.03
+MP_MIN_HIST = 250  # 指標至少有 250 天歷史才算百分位
+MP_POS = [30, 40, 50, 65, 80]   # 樣本外五級（最差→最好）對應的建議持股%
+MP_SCHEMES = {'積極（30/40/50/65/80%）': [30, 40, 50, 65, 80], '溫和（50/55/60/65/70%）': [50, 55, 60, 65, 70]}
+MP_VT_NAME = '波動率目標（不靠模型）'
+MP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), MP_FILE_NAME)
+
+
+def _rsi_arr(c, n=14):
+    out = np.full(len(c), np.nan)
+    up = dn = None
+    for i in range(1, len(c)):
+        d = c[i] - c[i - 1]
+        u, w = max(d, 0.0), max(-d, 0.0)
+        up = u if up is None else up + (u - up) / n
+        dn = w if dn is None else dn + (w - dn) / n
+        out[i] = 100.0 if not dn else 100 - 100 / (1 + up / dn)
+    return out
+
+
+def mp_price_feats(dates, close):
+    c = pd.Series(np.asarray(close, dtype=float), index=list(dates))
+    f = pd.DataFrame(index=c.index)
+    f['距一年高點%'] = (c / c.rolling(252, min_periods=200).max() - 1) * 100
+    f['偏離200日均線%'] = (c / c.rolling(200, min_periods=180).mean() - 1) * 100
+    f['RSI14'] = _rsi_arr(c.values)
+    f['近20日漲幅%'] = (c / c.shift(20) - 1) * 100
+    f['60日波動率%'] = c.pct_change().rolling(60, min_periods=50).std() * math.sqrt(252) * 100
+    return f, c
+
+
+def mp_align(index, dates, vals, lag=0):
+    """把另一條日資料對齊到主序列日期（用當天或之前最近一筆；lag=1＝只用前一個交易日以前的，收盤後才公布的籌碼用）"""
+    s = pd.Series(np.asarray(vals, dtype=float), index=list(dates))
+    s = s[~s.index.duplicated(keep='last')].sort_index()
+    out = s.reindex(sorted(set(index) | set(s.index))).ffill().reindex(index)
+    return out.shift(lag) if lag else out
+
+
+def mp_targets(c):
+    v = c.values.astype(float)
+    n = len(v)
+    r20, d20 = np.full(n, np.nan), np.full(n, np.nan)
+    for i in range(n - 20):
+        r20[i] = (v[i + 20] / v[i] - 1) * 100
+        d20[i] = (v[i + 1:i + 21].min() / v[i] - 1) * 100
+    return r20, d20
+
+
+def _mp_pct_expanding(x):
+    srt, out = [], np.full(len(x), np.nan)
+    for i, v in enumerate(x):
+        if np.isfinite(v):
+            if len(srt) >= MP_MIN_HIST:
+                out[i] = bisect.bisect_left(srt, v) / len(srt)
+            bisect.insort(srt, v)
+    return out
+
+
+def _mp_rank(a):
+    return pd.Series(a).rank().values
+
+
+def _mp_spear(a, b, min_n=60):
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < min_n:
+        return float('nan')
+    ra, rb = _mp_rank(a[m]), _mp_rank(b[m])
+    sa, sb = ra.std(), rb.std()
+    return float(((ra - ra.mean()) * (rb - rb.mean())).mean() / (sa * sb)) if sa > 0 and sb > 0 else float('nan')
+
+
+def _mp_weights(X, y, tr):
+    k = X.shape[1]
+    w, ics = np.zeros(k), np.full(k, np.nan)
+    h = len(tr) // 2
+    for j in range(k):
+        ic = _mp_spear(X[tr, j], y[tr])
+        a, b = _mp_spear(X[tr[:h], j], y[tr[:h]]), _mp_spear(X[tr[h:], j], y[tr[h:]])
+        ics[j] = ic
+        if np.isfinite(ic) and abs(ic) >= MP_MIN_IC and np.isfinite(a) and np.isfinite(b) and np.sign(a) == np.sign(b) == np.sign(ic):
+            w[j] = ic
+    return w, ics
+
+
+def _mp_score(X, w, rows):
+    tot = np.abs(w).sum()
+    if tot == 0:
+        return np.zeros(len(rows))
+    Z = X[rows] - 0.5
+    Z = np.where(np.isfinite(Z), Z, 0.0)
+    return Z @ w / tot * 2
+
+
+MP_MODELS = (('ret', '報酬模型', '未來20日報酬'), ('risk', '風險模型', '未來20日最大跌幅'))
+# 風險模型不從資料學權重（各期間 IC 方向會翻來翻去，學出來的權重樣本外常常反向），
+# 改用市場常識固定方向、等權：+1＝數值越高之後跌幅越小，−1＝數值越高風險越大；walk-forward 只用來驗證，不調參數
+MP_RISK_PRIOR = {'距一年高點%': 1, '偏離200日均線%': 1, '60日波動率%': -1, '外資台指期淨未平倉(口)': 1, '外資台指期近20日變化(口)': 1, '美元兌台幣近20日變化%': -1, '外資現貨近20日買賣超(億)': 1}
+
+
+def _mp_model(X, y, r, dd, n, idx, kind, fixed=None):
+    """kind='ret'：預測未來20日報酬；'risk'：預測未來20日期間最大跌幅（分數高＝跌幅小＝風險低）"""
+    k = X.shape[1]
+    pred = np.full(n, np.nan)
+    qwf = np.full(n, -1)          # 持股模擬用的分級：每段只用訓練期分數的五分位當切點
+    folds, stab_hit, stab_n = [], np.zeros(k), np.zeros(k)
+    for t in range(MP_WARM, n, MP_STEP):
+        tr = np.arange(0, max(0, t - MP_EMB))
+        te = np.arange(t, min(n, t + MP_STEP))
+        w = fixed if fixed is not None else _mp_weights(X, y, tr)[0]
+        pred[te] = _mp_score(X, w, te)
+        has = np.isfinite(X[tr]).any(axis=1)
+        if has.sum() >= MP_MIN_HIST:
+            ed = np.quantile(_mp_score(X, w, tr)[has], [0.2, 0.4, 0.6, 0.8])
+            qwf[te] = np.searchsorted(ed, pred[te], side='right')
+        for j in range(k):
+            if w[j] != 0:
+                tic = _mp_spear(X[te, j], y[te])
+                if np.isfinite(tic):
+                    stab_n[j] += 1
+                    stab_hit[j] += np.sign(tic) == np.sign(w[j])
+        folds.append(dict(start=str(idx[t])[:10], w=[round(float(x), 4) for x in w]))
+    ok = np.isfinite(pred) & np.isfinite(y) & np.isfinite(r)
+    m = dict(kind=kind, n_oos=int(ok.sum()), valid=False)
+    if ok.sum() < 250:
+        return m, qwf
+    p, yy, rr, d = pred[ok], y[ok], r[ok], dd[ok]
+    m['oos_start'] = str(np.asarray(idx)[ok][0])[:10]
+    m['oos_ic'] = round(_mp_spear(p, yy), 3)
+    edges = [float(x) for x in np.quantile(p, [0.2, 0.4, 0.6, 0.8])]
+    q = np.searchsorted(edges, p, side='right')
+    tbl = []
+    for g in range(5):
+        mm = q == g
+        tbl.append(dict(n=int(mm.sum()), ret=round(float(rr[mm].mean()), 2), up=round(float((rr[mm] > 0).mean() * 100), 1),
+                        dd5=round(float((d[mm] <= -5).mean() * 100), 1), mdd=round(float(d[mm].mean()), 2)))
+    key = 'ret' if kind == 'ret' else 'mdd'      # 報酬模型看平均報酬、風險模型看平均最大跌幅，都要由差到好
+    m['mono'] = round(_mp_spear(np.arange(5, dtype=float), np.array([x[key] for x in tbl]), 3), 2)
+    m['quint'], m['edges'] = tbl, edges
+    m['valid'] = bool(m['oos_ic'] >= 0.05 and m['mono'] >= 0.7)
+    wf, icf = _mp_weights(X, y, np.arange(0, n - MP_EMB))
+    if fixed is not None:
+        wf = fixed
+    m['fixed'] = fixed is not None
+    m['w'] = [round(float(x), 4) for x in wf]
+    m['ic'] = [None if not np.isfinite(x) else round(float(x), 3) for x in icf]
+    m['stab'] = [None if not stab_n[j] else round(float(stab_hit[j] / stab_n[j] * 100)) for j in range(k)]
+    m['nf'] = [int(x) for x in stab_n]
+    m['folds'] = folds
+    return m, qwf
+
+
+def mp_walkforward(F, c, market):
+    """F：特徵（index＝日期）；c：指數收盤 → 報告＋評分卡（報酬模型＋風險模型，dict 可直接存成 JSON）"""
+    cols = list(F.columns)
+    raw = F.values.astype(float)
+    X = np.column_stack([_mp_pct_expanding(raw[:, j]) for j in range(len(cols))])
+    r, dd = mp_targets(c)
+    n = len(r)
+    rep = dict(market=market, built=_ds(dt.date.today()), start=str(F.index[0])[:10], end=str(F.index[-1])[:10], cols=cols)
+    pri = np.array([float(MP_RISK_PRIOR.get(c_, 0)) for c_ in cols])
+    rep['models'], qw = {}, {}
+    for kd, _, _ in MP_MODELS:
+        rep['models'][kd], qw[kd] = _mp_model(X, (r if kd == 'ret' else dd), r, dd, n, F.index, kd, fixed=(pri if kd == 'risk' and pri.any() else None))
+    mr = rep['models']['ret']
+    rep['n_oos'] = mr['n_oos']
+    if mr['n_oos'] < 250:
+        rep['msg'] = f"樣本外天數只有 {mr['n_oos']} 天（需要 ≥250），歷史資料太短，無法驗證"
+        return rep
+    ok = np.isfinite(r) & (np.arange(n) >= MP_WARM)
+    rep['oos_start'] = mr['oos_start']
+    rep['base'] = dict(ret=round(float(r[ok].mean()), 2), up=round(float((r[ok] > 0).mean() * 100), 1),
+                       dd5=round(float((dd[ok] <= -5).mean() * 100), 1), mdd=round(float(dd[ok].mean()), 2))
+    mp_simulate(rep, F, c, qw)
+    rep['valid'] = rep.get('pick') is not None
+    rep['ref'] = [[round(float(v), 4) for v in np.sort(raw[:, j][np.isfinite(raw[:, j])])] for j in range(len(cols))]
+    rep['w'] = True   # 舊欄位相容：有評分卡
+    rep['now'] = mp_reading(rep, {cols[j]: raw[-1, j] for j in range(len(cols))}, str(F.index[-1])[:10])
+    return rep
+
+
+def _mp_metrics(pos, rd, mask):
+    p = np.where(np.isfinite(pos), pos, 1.0)[mask]
+    d = rd[mask] * p
+    if len(d) < 250:
+        return None
+    eq = np.cumprod(1 + d)
+    yrs = len(d) / 252
+    sd = d.std(ddof=1)
+    cagr = eq[-1] ** (1 / yrs) - 1
+    mdd = float((eq / np.maximum.accumulate(eq) - 1).min())
+    return dict(cagr=round(cagr * 100, 2), vol=round(sd * math.sqrt(252) * 100, 2), mdd=round(mdd * 100, 2),
+                sharpe=round(float(d.mean() / sd * math.sqrt(252)) if sd > 0 else 0.0, 2),
+                calmar=round(cagr / abs(mdd), 2) if mdd < 0 else None, avgpos=round(float(p.mean() * 100)))
+
+
+def mp_simulate(rep, F, c, qw):
+    """持股策略模擬（樣本外每天依當天收盤後的分級決定隔天持股，空手部位報酬算 0）：
+    兩個模型 × 兩種持股對照表、波動率目標法（持股＝過去波動率中位數÷目前波動率，30～100%）、永遠滿倉。
+    夏普值比永遠滿倉高 ≥0.05 且最大回撤較小的方式中，取夏普值最高的當建議；都沒有就不調整持股"""
+    cv = c.values.astype(float)
+    n = len(cv)
+    rd = np.full(n, np.nan)
+    rd[:-1] = cv[1:] / cv[:-1] - 1
+    mask = (np.arange(n) >= MP_WARM) & np.isfinite(rd)
+    rows = []
+    bh = _mp_metrics(np.ones(n), rd, mask)
+    if not bh:
+        return
+    rows.append(dict(name='永遠滿倉（對照）', kind='bh', **bh))
+    for kd, nm, _ in MP_MODELS:
+        q = qw.get(kd)
+        m = rep['models'].get(kd) or {}
+        if q is None or not m.get('quint'):
+            continue
+        for sn, sch in MP_SCHEMES.items():
+            pos = np.where(q >= 0, np.array(sch + [100])[np.clip(q, 0, 4)] / 100.0, np.nan)
+            mt = _mp_metrics(pos, rd, mask)
+            if mt:
+                rows.append(dict(name=f'{nm}・{sn}', kind='model', model=kd, scheme=sn, pos=sch, valid=bool(m.get('valid')), **mt))
+    if '60日波動率%' in F.columns:
+        v = F['60日波動率%'].values.astype(float)
+        med = pd.Series(v).expanding(min_periods=MP_MIN_HIST).median().values
+        pos = np.clip(med / v, 0.3, 1.0)
+        mt = _mp_metrics(pos, rd, mask)
+        if mt:
+            rows.append(dict(name=MP_VT_NAME, kind='vt', valid=True, **mt))
+        rep['vt_med'] = float(np.nanmedian(v))
+    rep['sim'] = rows
+    cand = [x for x in rows if x['kind'] != 'bh' and x.get('valid') and x['sharpe'] >= bh['sharpe'] + 0.05 and x['mdd'] > bh['mdd']]
+    best = max(cand, key=lambda x: x['sharpe']) if cand else None
+    rep['pick'] = None if not best else {k_: best.get(k_) for k_ in ('name', 'kind', 'model', 'scheme', 'pos', 'sharpe', 'mdd', 'cagr')}
+
+
+def _mp_read_model(m, pcts):
+    if not m.get('w'):
+        return None
+    z = sum(w * (pc - 0.5) for w, pc in zip(m['w'], pcts) if pc is not None)
+    tot = sum(abs(w) for w in m['w'])
+    s = z / tot * 2 if tot else 0.0
+    q = int(np.searchsorted(m['edges'], s, side='right'))
+    qt = m['quint'][q]
+    det = sorted([dict(i=j, contrib=round(w * (pc - 0.5), 4)) for j, (w, pc) in enumerate(zip(m['w'], pcts)) if pc is not None and w],
+                 key=lambda x: -abs(x['contrib']))
+    return dict(score=round(s, 3), q=q + 1, ret=qt['ret'], up=qt['up'], dd5=qt['dd5'], mdd=qt['mdd'], valid=m['valid'], oos_ic=m['oos_ic'], top=det[:3])
+
+
+def mp_reading(sc, vals, asof):
+    """用評分卡算「今天」：各指標在完整歷史的百分位 → 報酬模型／風險模型各自第幾級 → 建議持股（有效的模型取平均）"""
+    if not sc or not sc.get('models'):
+        return None
+    pcts, det = [], []
+    for j, nm in enumerate(sc['cols']):
+        v, ref = vals.get(nm), sc['ref'][j]
+        pc = (bisect.bisect_left(ref, v) / len(ref)) if (v is not None and np.isfinite(v) and len(ref) >= MP_MIN_HIST) else None
+        pcts.append(pc)
+        det.append(dict(name=nm, val=None if v is None or not np.isfinite(v) else round(float(v), 2), pct=None if pc is None else round(pc * 100)))
+    rd = {kd: _mp_read_model(sc['models'][kd], pcts) for kd, _, _ in MP_MODELS if sc['models'].get(kd)}
+    pk, pos = sc.get('pick'), None
+    if pk and pk.get('kind') == 'model' and rd.get(pk['model']):
+        pos = pk['pos'][rd[pk['model']]['q'] - 1]
+    elif pk and pk.get('kind') == 'vt' and sc.get('vt_med'):
+        vn = vals.get('60日波動率%')
+        if vn is not None and np.isfinite(vn) and vn > 0:
+            pos = int(round(min(1.0, max(0.3, sc['vt_med'] / vn)) * 100 / 5) * 5)
+    return dict(asof=asof, models=rd, pos=pos, valid=pos is not None, pick=pk['name'] if pk else None, det=det)
+
+
+def mp_build(token, years, log=None):
+    H = mp_fetch(token, years, log)
+    F, c = mp_features(H)
+    return mp_walkforward(F, c, MP_MARKET)
+
+
+def mp_save(rep):
+    try:
+        with open(MP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(rep, f, ensure_ascii=False)
+        return True
+    except Exception:  # noqa
+        return False
+
+
+def mp_load():
+    try:
+        with open(MP_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return None
+
+
+def mp_live(token, sc):
+    """批次分析時：抓近約1.7年的大盤指標，算今天的評分卡讀數（每批只算一次）"""
+    if not sc or not sc.get('models'):
+        return None
+    try:
+        F, c = mp_features(mp_fetch(token, 1.7))
+        return mp_reading(sc, {nm: (F[nm].iloc[-1] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[-1])[:10])
+    except Exception as ex:  # noqa
+        return dict(err=str(ex)[:150])
+
+
+def mp_guide_text(pred, ps0):
+    """大盤指引的建議持股行（評分卡持股策略模擬勝過永遠滿倉時）"""
+    rk = pred['models'].get('risk') or {}
+    return (f"・**建議持股 {pred['pos']}%（依大盤預測評分卡持股策略：{pred.get('pick')}；目前風險模型第 {rk.get('q', '--')}/5 級）**　"
+            + (f"風險模型：未來20日期間跌≥5% 機率 {rk['dd5']:.0f}%、平均最大跌幅 {rk['mdd']:.1f}%" if rk else '')
+            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）")
+
+
+def mp_panel_line(pr):
+    if not pr:
+        return None
+    if pr.get('err'):
+        return f"🔮 大盤預測評分卡：今天讀數抓取失敗（{pr.get('err')}）"
+    parts = []
+    for kd, nm, _ in MP_MODELS:
+        x = pr['models'].get(kd)
+        if not x:
+            continue
+        tag = f"✅IC {x['oos_ic']:+.2f}" if x['valid'] else f"⚠️未通過 IC {x['oos_ic']:+.2f}"
+        parts.append(f"{nm} **第 {x['q']}/5 級**（{tag}；樣本外歷史：未來20日平均 {x['ret']:+.2f}%、跌≥5% 機率 {x['dd5']:.0f}%）")
+    return (f"🔮 大盤預測評分卡（{pr['asof']}）：" + '　｜　'.join(parts)
+            + (f"　→ 持股策略：{pr['pick']}" if pr.get('pick') else '　→ 持股策略模擬沒有比永遠滿倉更好的方式，建議持股維持原規則'))
+
+
+def render_market_pred(st, ss, K):
+    st.subheader('🔮 大盤預測評分卡（walk-forward 樣本外驗證）')
+    st.caption('用 10 年以上的大盤層級指標（' + MP_DESC + '），每半年只用「當時以前」的資料重算各指標權重，預測下半年。'
+               '同時建兩個模型：**報酬模型**從資料學各指標權重、預測未來20日報酬；**風險模型**不學權重，依市場常識固定方向（波動率、VIX 高、跌破長期均線＝風險高）'
+               '預測未來20日期間最大跌幅（波動有群聚性，通常比報酬好預測），walk-forward 只用來驗證。'
+               '模型樣本外有效（IC≥0.05、五級表現由差到好單調）才可用；再做持股策略模擬（積極／溫和兩種對照表、波動率目標法），'
+               '夏普值勝過永遠滿倉且回撤較小的方式才拿來當建議持股，否則維持原本的溫度計＋K線規則。每次批次分析會多抓約' + MP_LIVE_COST + '的大盤資料。')
+    c1, c2 = st.columns([1, 2])
+    yrs = c1.slider('歷史年數', 8, 20, 15, key='mp_years')
+    if c2.button('🔮 執行大盤預測回測', type='primary', key='run_mp'):
+        tok = ss.get('token', '').strip()
+        if not tok:
+            st.error('請先輸入 API Key')
+        else:
+            try:
+                with st.spinner('抓取大盤歷史資料並做樣本外驗證中…'):
+                    rep = mp_build(tok, yrs)
+                ss['mp_rep'] = rep
+                if rep.get('models'):
+                    mp_save(rep)
+            except Exception as ex:  # noqa
+                st.error(f'❌ 大盤預測回測失敗：{ex}')
+    up_ = st.file_uploader('或載入先前下載的評分卡（.json；Streamlit Cloud 重新啟動後本機檔案會消失，可用這個還原）', type=['json'], key='mp_up')
+    if up_ is not None and ss.get('_mp_up_sig') != (up_.name, up_.size):
+        try:
+            ss['mp_rep'] = json.loads(up_.getvalue().decode('utf-8'))
+            ss['_mp_up_sig'] = (up_.name, up_.size)
+            if ss['mp_rep'].get('models'):
+                mp_save(ss['mp_rep'])
+        except Exception as ex:  # noqa
+            st.error(f'評分卡檔案讀取失敗：{ex}')
+    rep = ss.get('mp_rep') or mp_load()
+    if not rep or not rep.get('models'):
+        st.info('按「🔮 執行大盤預測回測」開始。' + ('（舊版評分卡格式，請重新執行）' if rep else ''))
+        return
+    st.download_button('💾 下載評分卡（.json）', json.dumps(rep, ensure_ascii=False).encode('utf-8'),
+                       file_name=f"大盤預測評分卡_{rep.get('market', '')}_{rep.get('built', '')}.json", key='mp_dl')
+    st.markdown(f"**資料期間** {rep['start']} ～ {rep['end']}　｜　樣本外 {rep.get('oos_start', '--')} 起共 {rep['n_oos']} 天　｜　建立於 {rep['built']}")
+    if rep.get('msg'):
+        st.warning(rep['msg'])
+        return
+    b = rep['base']
+    for kd, nm, tgt in MP_MODELS:
+        m = rep['models'].get(kd) or {}
+        if not m.get('quint'):
+            continue
+        st.markdown(f'#### {nm}（預測{tgt}' + ('，依市場常識固定方向、不擬合' if m.get('fixed') else '，權重每半年從資料重學') + '）')
+        (st.success if m['valid'] else st.warning)(
+            f"{'✅ 樣本外驗證有效' if m['valid'] else '⚠️ 樣本外驗證未通過'}：IC {m['oos_ic']:+.3f}、五級單調度 {m['mono']:+.2f}"
+            + ('（需要 IC≥0.05 且單調度≥0.7）→ 不採用' if not m['valid'] else ' → 可用，持股對照表看下方「持股策略模擬」'))
+        st.dataframe(pd.DataFrame([dict(級別=f'第{k + 1}級' + ('（最差）' if k == 0 else '（最好）' if k == 4 else ''), 天數=x['n'],
+                                        未來20日平均報酬=x['ret'], 上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 平均最大跌幅=x['mdd'],
+                                        建議持股=((rep['pick']['pos'][k] if rep.get('pick') and rep['pick'].get('model') == kd else '—') if m['valid'] else '不採用'))
+                                   for k, x in enumerate(m['quint'])]
+                                  + [dict(級別='全部（永遠持有）', 天數=rep['n_oos'], 未來20日平均報酬=b['ret'], 上漲機率=b['up'],
+                                          期間跌5以上機率=b['dd5'], 平均最大跌幅=b['mdd'], 建議持股='')]),
+                     hide_index=True, use_container_width=True)
+    if rep.get('sim'):
+        st.markdown('#### 持股策略模擬（樣本外每天依當天分級決定隔天持股；分級切點只用當時以前的資料；空手報酬算 0）')
+        pk = rep.get('pick')
+        (st.success if pk else st.warning)(
+            f"✅ 建議採用：**{pk['name']}**（夏普 {pk['sharpe']}、最大回撤 {pk['mdd']}%、年化 {pk['cagr']}%）→ 批次分析的建議持股改用這個方式" if pk else
+            '⚠️ 沒有任何方式的夏普值比永遠滿倉高 0.05 以上、同時回撤較小 → 建議持股維持原本的溫度計＋K線規則')
+        st.dataframe(pd.DataFrame([dict(方式=x['name'] + ('' if x.get('valid', True) else '（模型未通過）'), 年化報酬=x['cagr'], 年化波動=x['vol'], 最大回撤=x['mdd'],
+                                        夏普=x['sharpe'], 卡瑪=x['calmar'], 平均持股=x['avgpos']) for x in rep['sim']]),
+                     hide_index=True, use_container_width=True)
+    st.markdown('**各指標有效性**（IC＝全期間百分位跟目標的等級相關；權重0＝前後兩半不同方向或 |IC|<0.03；樣本外一致率＝有給權重的各半年裡，測試期 IC 跟訓練期同方向的比例）')
+    rows = []
+    for j, nm in enumerate(rep['cols']):
+        o = dict(指標=nm)
+        for kd, mn, _ in MP_MODELS:
+            m = rep['models'].get(kd) or {}
+            if m.get('w'):
+                o[f'{mn}IC'] = m['ic'][j]
+                o[f'{mn}權重'] = m['w'][j]
+                o[f'{mn}一致率'] = f"{m['stab'][j]}%（{m['nf'][j]}段）" if m['stab'][j] is not None else '—'
+        rows.append(o)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    now = rep.get('now')
+    if now:
+        st.markdown(mp_panel_line(now))
+        if now.get('pos') is not None:
+            st.markdown(mp_guide_text(now, None).replace('（原本溫度計＋K線規則為 --%）', ''))
+        st.dataframe(pd.DataFrame([dict(指標=d['name'], 目前數值=d['val'], 歷史百分位=d['pct']) for d in now['det']]),
+                     hide_index=True, use_container_width=True)
+
+
 def summary_frame(results, extras_flags, K, live=None):
     ensure_flagsets(results)
     recs = []
@@ -2956,7 +3724,7 @@ def summary_frame(results, extras_flags, K, live=None):
         mm = matched_combos(r['row'], K['MOONSHOT_COMBOS'])
         ms = matched_combos(r['row'], K['STOCK_PICK_COMBOS'])
         rec = {
-            '股票': r['stockId'], '名稱': r['name'] + (' 🔴即時' if r.get('realtime') else ''),
+            '類股': r.get('industry') or '', '股票': r['stockId'], '名稱': r['name'] + (' 🔴即時' if r.get('realtime') else ''),
             '多方力道': r['total'], '評等': score_label(r['total']),
             '+DI': dm['plusDI'], '-DI': dm['minusDI'], 'ADX': dm['adx'], 'ADXR': dm['adxr'],
             '布林位置%': sig['bbPos'], '布林寬度%': bbw,
@@ -2969,6 +3737,17 @@ def summary_frame(results, extras_flags, K, live=None):
             p = r.get('peRange')
             rec['P/E'] = p['current'] if p else None
             rec['P/E區間'] = f"{p['min']:.1f}~{p['max']:.1f}" if p else '無資料'
+            rec['P/B'] = round(p['pb'], 2) if p and p.get('pb') else None
+            rec['殖利率%'] = round(p['dy'], 2) if p and p.get('dy') is not None else None
+        if extras_flags.get('chip2'):
+            rw2 = r['row']
+            f1 = lambda k, d=1: round(rw2[k], d) if isnum(rw2.get(k)) else None
+            rec['融資20日%'] = f1('mgChg20')
+            rec['券資比%'] = f1('ssRatio')
+            rec['外資持股20日變化pp'] = f1('fhChg20', 2)
+            rec['千張大戶4週變化pp'] = f1('bigChg4w', 2)
+            rec['股東人數4週%'] = f1('pplChg4w')
+            rec['借券賣出20日%'] = f1('sblChg20')
         if extras_flags.get('rev'):
             rv = r.get('revRange')
             rec['營收YoY%(最新)'] = rv[-1]['yoy'] if rv else None
@@ -2990,6 +3769,8 @@ def summary_frame(results, extras_flags, K, live=None):
             bt = best_t(combo_stats(c, kind, K, live))
             return f'(t{bt:.1f})' if bt is not None else ''
         rec['選股型命中'] = ' '.join(f'S{i + 1}' + _t(K['STOCK_PICK_COMBOS'][i], 'S') for i in ms)
+        if ms and isnum(r['row'].get('pe')) and 0 < r['row']['pe'] < 12:   # 回測：S命中但P/E<12倍，超額 3.19%→1.13%（近兩年 t -3.3）
+            rec['選股型命中'] += ' ⚠️低本益比'
         rec['指定組合命中'] = ' '.join([f'#{i + 1}' + ('⏱' if is_timing_combo(K['PINNED_COMBOS'][i]) else '')
                                     + _t(K['PINNED_COMBOS'][i], '#') for i in mp]
                                    + [f'M{i + 1}' + _t(K['MOONSHOT_COMBOS'][i], 'M') for i in mm])
@@ -3026,7 +3807,7 @@ def summary_frame(results, extras_flags, K, live=None):
         return df
     # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
     df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
-    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
+    front = ['類股', '股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
 
@@ -3320,11 +4101,16 @@ def draw_chart(r, vp_params):
 # ════════════════════════════════════════════════════════════════════
 def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=None, progress=None):
     log = log or (lambda m: None)
-    names = fetch_name_map(token)
+    names, inds = fetch_stock_info(token)
     try:
         bm = fetch_benchmark(token, days)
     except Exception:  # noqa
         bm = None
+    try:   # 大盤期現貨籌碼（外資台指期未平倉、整體融資）：整批只抓一次
+        mkt_chip = fetch_mkt_chip(token, 120)
+    except Exception:  # noqa
+        mkt_chip = {}
+    mcf = mkt_chip_feats(_ds(dt.date.today() + dt.timedelta(days=1)), mkt_chip)
     rt_map = {}
     if use_rt:
         rt_map, rt_err = fetch_realtime(token, stocks)
@@ -3362,7 +4148,22 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
                     extras['instRange'], extras['instFlow'] = fetch_inst_monthly(sid, token, with_flow=True)
                 except Exception as ex2:  # noqa
                     extras['instRangeErr'] = str(ex2)
+            c2 = dict(mcf)
+            if ex_flags.get('chip2'):   # 融資融券／外資持股／千張大戶／借券賣出（各 1 次 API）
+                CH = {}
+                for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist), ('hold', fetch_holding_hist), ('sbl', fetch_sbl_hist)):
+                    try:
+                        CH[k_] = fn_(sid, token, 400)
+                    except Exception as ex3:  # noqa
+                        extras['chip2Err'] = str(ex3)[:150]
+                bx = Bars(rows_full)
+                fake = type('B', (), {})()
+                fake.date = list(bx.date) + [_ds(dt.date.today() + dt.timedelta(days=1))]   # 「明天」當評估日 → 用到今天（含）的籌碼
+                fake.close = list(bx.close) + [bx.close[-1]]
+                c2.update(chip2_feats(fake, len(fake.date) - 1, CH))
+            extras['chip2'] = c2
             r = analyze_stock(sid, names.get(sid, sid), rows, bm, vpp, extras)
+            r['industry'] = inds.get(sid, '')
             results.append(r)
             log(f"✅ {sid} {r['name']}  得分:{r['total']}" + ('　🔴即時' if rt else ''))
         except Exception as ex:  # noqa
@@ -3373,8 +4174,12 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
             time.sleep(delay)
     results.sort(key=lambda r: -r['total'])
     _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
+    _sc = mp_load()
+    _mpr = mp_live(token, _sc) if _sc and _sc.get('w') else None
     for r in results:
+        r['mkt_pred'] = _mpr
         r['bm_close'] = _bmc   # 大盤K線位置用（同一份清單，不重複佔記憶體）
+        r['mkt_chip'] = mcf
     ensure_flagsets(results)
     return results
 
@@ -3696,7 +4501,7 @@ def run_daily(argv):
     if _reg:
         print(regime_banner(_reg).replace('**', ''))
     _ml, _mt, _kp = market_panel_lines(results, K)
-    for _ln in _ml + ['📋 大盤指引'] + market_guide_lines(_mt, _kp):
+    for _ln in _ml + ['📋 大盤指引'] + market_guide_lines(_mt, _kp, next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None)):
         print(_ln.replace('**', ''))
     recs = hit_records(results, K)
     added = append_hit_log(recs)
@@ -3761,7 +4566,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-20 目標價／P/E位階'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-23 類股欄位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -3838,7 +4643,8 @@ def main():
         st.caption('以下每勾一項，每檔股票多打1次API：')
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'), rev=st.checkbox('📈 近3月營收YoY/MoM', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3月均價YoY', key='x_pxyoy'),
-                        inst=st.checkbox('🏦 三大法人買賣超（近3月）', key='x_inst'))
+                        inst=st.checkbox('🏦 三大法人買賣超（近3月）', key='x_inst'),
+                        chip2=st.checkbox('🧮 進階籌碼：融資融券／外資持股／千張大戶／借券（每檔多4次API）', key='x_chip2'))
         req_delay = st.number_input('每檔間隔秒數（避免API限速）', 0.0, 5.0, 0.6, 0.1, key='req_delay')
         st.checkbox('📌 批次分析後自動把命中組合股票加入追蹤', value=True, key='auto_track')
         run_batch = st.button('🔍 批次分析', type='primary', use_container_width=True, key='run_batch')
@@ -3879,7 +4685,9 @@ def main():
                        '三段都下載後，三個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋會自動逐段（第1／2／3段）驗證。')
         bt_div = st.checkbox('📈 近3月YoY乖離度（股價歷史要抓超過1年）', key='bt_div')
         bt_inst = st.checkbox('🏦 三大法人買賣超（近3月）', key='bt_inst')
-        bt_pe = st.checkbox('📐 本益比位階（P/E在近3年的百分位、P/E<12／≥30倍、虧損；每檔多1次API）', value=True, key='bt_pe')
+        bt_pe = st.checkbox('📐 本益比／淨值比位階、殖利率（P/E、P/B 近3年百分位；每檔多1次API）', value=True, key='bt_pe')
+        bt_chip2 = st.checkbox('🧮 進階籌碼：融資融券／外資持股／千張大戶／借券賣出（每檔多4次API）', value=True, key='bt_chip2',
+                               help='外資台指期未平倉、整體融資餘額整次回測只抓一次，不用另外勾。某類資料前20檔都失敗（方案不支援）會自動停止抓取')
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
         bt_delay = st.number_input('回測每檔間隔秒數', 0.0, 5.0, 0.3, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
@@ -3962,7 +4770,7 @@ def main():
                 det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔'
                             + (f'\n\n{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_inst, bt_liq * 10000, vpp,
-                                   delay=bt_delay, on_progress=onp, end_offset_months=bt_off, include_pe=bt_pe)
+                                   delay=bt_delay, on_progress=onp, end_offset_months=bt_off, include_pe=bt_pe, include_chip2=bt_chip2)
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             ss['bt_df'] = store_bt_df(df)
@@ -3972,19 +4780,24 @@ def main():
                         + (f"（途中因 FinMind 額度用完暫停約 {stt['quota_wait_min']} 分鐘）" if stt.get('quota_wait_min') else ''))
             if stt.get('stopped'):
                 st.error(f"⚠️ 回測提前結束：{stt['stopped']}")
+            for k_ in ('chip_err', 'mkt_err'):
+                if stt.get(k_):
+                    st.warning('⚠️ ' + stt[k_])
             if not len(df):
                 st.error('❌ 這次回測沒有產生任何評估紀錄。失敗原因：' + ('；'.join(stt.get('top_fail') or []) or '不明')
                          + '。常見原因：Token 錯誤、FinMind 連線不到。')
             elif stt['failed'] > max(20, stt['total'] * 0.2):
                 st.warning(f"⚠️ 有 {stt['failed']} 檔失敗（共 {stt['total']} 檔），結果可能不完整。主要原因：" + '；'.join(stt.get('top_fail') or []))
 
-    tab_batch, tab_track, tab_bt = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測'])
+    tab_batch, tab_track, tab_bt, tab_mp = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測', '🔮 大盤預測'])
     with tab_batch:
         render_batch(st, ss, K)
     with tab_track:
         render_tracking(st, ss, K)
     with tab_bt:
         render_backtest(st, ss, K)
+    with tab_mp:
+        render_market_pred(st, ss, K)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -4019,7 +4832,7 @@ def render_batch(st, ss, K):
     _ml, _mt, _kp = market_panel_lines(results, K)
     (st.success if _ml[-1].startswith('🟢') else st.error if _ml[-1].startswith('🔴') else st.info)('\n\n'.join(_ml))
     with st.expander('📋 大盤指引（白話解讀與觀察重點）', expanded=True):
-        st.markdown('\n\n'.join(market_guide_lines(_mt, _kp)))
+        st.markdown('\n\n'.join(market_guide_lines(_mt, _kp, next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))))
     if '組合型態' in df.columns and len(df):
         _bc = st.columns(len(STYLE_LISTS))
         for (_sty, _ln), _c in zip(STYLE_LISTS, _bc):
@@ -7687,6 +8500,26 @@ BT_HOT_COMBOS = [
     ["月營收創24個月新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "夜星剛形成"],
     ["地量(≤0.5倍均量)", "連續放量(近3日均量≥1.5倍前20日均量)", "OBV能量潮創60日新高"],
 
+    # 2026-10-22 新增（台股三年三段、本益比位階回測）：P/E條件讓飆股比例比不含P/E的同組合高≥5個百分點，三年各≥2倍
+    ["P/E≥30倍", "強勢突破盤", "地量(≤0.5倍均量)"],
+    ["P/E≥30倍", "地量(≤0.5倍均量)", "創52週新高"],
+    ["P/E≥30倍", "地量(≤0.5倍均量)", "OBV能量潮創60日新高"],
+    ["虧損(無P/E)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["P/E≥30倍", "多方力道≥80", "量能區間低檔(≤10百分位)"],
+    ["P/E≥30倍", "近20日強於大盤≥10%", "母子懷抱(低檔)剛形成"],
+    ["P/E≥30倍", "地量(≤0.5倍均量)", "距52週高點≤5%"],
+    ["虧損(無P/E)", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["虧損(無P/E)", "創52週新高", "近3月均價YoY為負"],
+    ["虧損(無P/E)", "創52週新高", "月營收連3月年增"],
+    ["P/E≥30倍", "CMF資金流買方佔優(近20日≥0.1)", "月營收創24個月新高"],
+    ["虧損(無P/E)", "創52週新高", "CMF資金流買方佔優(近20日≥0.1)"],
+    ["P/E≥30倍", "布林通道高檔(≥80%)", "地量(≤0.5倍均量)"],
+    ["P/E≥30倍", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
+    ["P/E≥30倍", "爆量(≥2倍均量)", "月營收創24個月新高"],
+    ["虧損(無P/E)", "近20日強於大盤≥10%", "N字底剛形成"],
+    ["P/E≥30倍", "量能區間低檔(≤10百分位)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["P/E≥30倍", "距52週高點≤5%", "月營收創24個月新高"],
+    ["P/E≥30倍", "母子懷抱(低檔)剛形成", "晨星剛形成"],
 ]
 BT_HOT_STATS = {
     "MACD近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 三大法人近3月賣超": {"10": {"n": 167, "moonshotN": 20, "pct": 12.0, "avg": 50.4}, "20": {"n": 167, "moonshotN": 21, "pct": 12.6, "avg": 65.7}},
@@ -7990,6 +8823,25 @@ BT_HOT_STATS = {
     "月營收創24個月新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 夜星剛形成": {"10": {"n": 113, "moonshotN": 9, "pct": 8.0, "avg": 47.5}, "20": {"n": 113, "moonshotN": 13, "pct": 11.5, "avg": 57.5}},
     "地量(≤0.5倍均量) ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ OBV能量潮創60日新高": {"10": {"n": 65, "moonshotN": 6, "pct": 9.2, "avg": 51.4}, "20": {"n": 65, "moonshotN": 12, "pct": 18.5, "avg": 60.9}},
 
+    "P/E≥30倍 ＋ 強勢突破盤 ＋ 地量(≤0.5倍均量)": {"10": {"n": 276, "moonshotN": 32, "pct": 11.6, "avg": 47.6}, "20": {"n": 276, "moonshotN": 64, "pct": 23.2, "avg": 55.9}},
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 385, "moonshotN": 38, "pct": 9.9, "avg": 45.6}, "20": {"n": 385, "moonshotN": 84, "pct": 21.8, "avg": 53.1}},
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ OBV能量潮創60日新高": {"10": {"n": 336, "moonshotN": 33, "pct": 9.8, "avg": 43.6}, "20": {"n": 336, "moonshotN": 65, "pct": 19.3, "avg": 49.9}},
+    "虧損(無P/E) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 993, "moonshotN": 105, "pct": 10.6, "avg": 44.6}, "20": {"n": 993, "moonshotN": 172, "pct": 17.3, "avg": 54.4}},
+    "P/E≥30倍 ＋ 多方力道≥80 ＋ 量能區間低檔(≤10百分位)": {"10": {"n": 221, "moonshotN": 14, "pct": 6.3, "avg": 38.0}, "20": {"n": 221, "moonshotN": 38, "pct": 17.2, "avg": 47.4}},
+    "P/E≥30倍 ＋ 近20日強於大盤≥10% ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 261, "moonshotN": 26, "pct": 10.0, "avg": 42.7}, "20": {"n": 261, "moonshotN": 45, "pct": 17.2, "avg": 56.9}},
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": {"10": {"n": 889, "moonshotN": 71, "pct": 8.0, "avg": 44.5}, "20": {"n": 889, "moonshotN": 150, "pct": 16.9, "avg": 52.9}},
+    "虧損(無P/E) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 1012, "moonshotN": 87, "pct": 8.6, "avg": 43.9}, "20": {"n": 1012, "moonshotN": 167, "pct": 16.5, "avg": 51.3}},
+    "虧損(無P/E) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 807, "moonshotN": 63, "pct": 7.8, "avg": 43.5}, "20": {"n": 807, "moonshotN": 133, "pct": 16.5, "avg": 51.1}},
+    "虧損(無P/E) ＋ 創52週新高 ＋ 月營收連3月年增": {"10": {"n": 735, "moonshotN": 77, "pct": 10.5, "avg": 45.8}, "20": {"n": 735, "moonshotN": 120, "pct": 16.3, "avg": 55.5}},
+    "P/E≥30倍 ＋ CMF資金流買方佔優(近20日≥0.1) ＋ 月營收創24個月新高": {"10": {"n": 3112, "moonshotN": 221, "pct": 7.1, "avg": 47.2}, "20": {"n": 3112, "moonshotN": 489, "pct": 15.7, "avg": 53.7}},
+    "虧損(無P/E) ＋ 創52週新高 ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 1125, "moonshotN": 87, "pct": 7.7, "avg": 45.2}, "20": {"n": 1125, "moonshotN": 175, "pct": 15.6, "avg": 51.7}},
+    "P/E≥30倍 ＋ 布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量)": {"10": {"n": 1245, "moonshotN": 94, "pct": 7.6, "avg": 45.9}, "20": {"n": 1245, "moonshotN": 193, "pct": 15.5, "avg": 53.3}},
+    "P/E≥30倍 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 395, "moonshotN": 30, "pct": 7.6, "avg": 43.5}, "20": {"n": 395, "moonshotN": 61, "pct": 15.4, "avg": 52.6}},
+    "P/E≥30倍 ＋ 爆量(≥2倍均量) ＋ 月營收創24個月新高": {"10": {"n": 1607, "moonshotN": 124, "pct": 7.7, "avg": 47.8}, "20": {"n": 1607, "moonshotN": 247, "pct": 15.4, "avg": 55.1}},
+    "虧損(無P/E) ＋ 近20日強於大盤≥10% ＋ N字底剛形成": {"10": {"n": 203, "moonshotN": 18, "pct": 8.9, "avg": 46.3}, "20": {"n": 203, "moonshotN": 31, "pct": 15.3, "avg": 57.2}},
+    "P/E≥30倍 ＋ 量能區間低檔(≤10百分位) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 441, "moonshotN": 24, "pct": 5.4, "avg": 42.2}, "20": {"n": 441, "moonshotN": 66, "pct": 15.0, "avg": 48.1}},
+    "P/E≥30倍 ＋ 距52週高點≤5% ＋ 月營收創24個月新高": {"10": {"n": 2711, "moonshotN": 178, "pct": 6.6, "avg": 42.9}, "20": {"n": 2711, "moonshotN": 406, "pct": 15.0, "avg": 50.2}},
+    "P/E≥30倍 ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 214, "moonshotN": 15, "pct": 7.0, "avg": 44.7}, "20": {"n": 214, "moonshotN": 32, "pct": 15.0, "avg": 46.9}},
 }
 BT_HIT_SHOW = 3   # 摘要表每類最多顯示幾個編號，其餘以「+N」表示
 
@@ -9267,6 +10119,25 @@ REGIME_STATS = {
     "KDJ近3日內黃金交叉 ＋ 突破ABC修正下降切線剛形成 ＋ 近3日漲停": [[402, 52.0, 4.46, 2.19], [90, 55.6, 4.35, 0.76], [44, 45.5, 3.15, 0.84], [39, 43.6, 1.16, 0.76]],
     "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 夜星剛形成 ＋ 月營收創24個月新高": [[76, 47.4, 3.19, 1.55], None, None, None],
     "OBV能量潮創60日新高 ＋ 地量(≤0.5倍均量) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[44, 59.1, 13.21, 3.12], None, None, None],
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ 強勢突破盤": [[236, 61.9, 10.36, 2.94], None, None, None],
+    "P/E≥30倍 ＋ 創52週新高 ＋ 地量(≤0.5倍均量)": [[328, 60.4, 8.04, 3.84], None, None, None],
+    "OBV能量潮創60日新高 ＋ P/E≥30倍 ＋ 地量(≤0.5倍均量)": [[261, 59.4, 6.5, 2.89], None, [38, 50.0, 6.2, 1.93], None],
+    "創52週新高 ＋ 虧損(無P/E) ＋ 近3月乖離度為正(營收優於股價)": [[737, 49.9, 5.62, 5.01], [158, 52.5, 7.32, 1.1], [59, 42.4, -2.22, -0.94], [39, 33.3, -3.32, -0.63]],
+    "P/E≥30倍 ＋ 多方力道≥80 ＋ 量能區間低檔(≤10百分位)": [[182, 53.8, 3.47, 3.1], None, None, None],
+    "P/E≥30倍 ＋ 母子懷抱(低檔)剛形成 ＋ 近20日強於大盤≥10%": [[181, 44.8, 2.81, 0.82], [38, 57.9, 12.91, 2.6], None, None],
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": [[723, 57.1, 5.44, 4.47], [76, 56.6, 9.21, 2.32], [64, 53.1, 9.1, 3.12], None],
+    "虧損(無P/E) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": [[797, 50.8, 4.13, 3.59], [126, 50.0, 4.5, 0.31], [54, 38.9, -3.47, -1.17], [35, 40.0, -10.11, -2.28]],
+    "創52週新高 ＋ 虧損(無P/E) ＋ 近3月均價YoY為負": [[567, 48.1, 3.45, 2.35], [146, 52.1, 5.31, 1.42], [53, 41.5, -3.68, -0.98], [41, 34.1, -4.94, -0.57]],
+    "創52週新高 ＋ 月營收連3月年增 ＋ 虧損(無P/E)": [[588, 49.3, 5.52, 4.93], [101, 42.6, 4.4, 1.73], None, None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ P/E≥30倍 ＋ 月營收創24個月新高": [[2386, 57.0, 6.08, 6.67], [337, 43.9, 3.0, 0.85], [200, 60.5, 5.56, 2.98], [189, 50.3, 2.76, 1.61]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 創52週新高 ＋ 虧損(無P/E)": [[848, 45.3, 2.24, 2.52], [169, 39.1, 2.12, -0.93], [60, 38.3, -4.69, -1.47], [48, 25.0, -18.36, -3.63]],
+    "P/E≥30倍 ＋ 地量(≤0.5倍均量) ＋ 布林通道高檔(≥80%)": [[997, 51.7, 4.0, 3.09], [99, 51.5, 5.32, 1.26], [112, 57.1, 6.04, 3.17], [37, 59.5, 4.56, 1.51]],
+    "P/E≥30倍 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": [[310, 45.5, 2.47, 1.96], [44, 54.5, 10.46, 2.04], None, None],
+    "P/E≥30倍 ＋ 月營收創24個月新高 ＋ 爆量(≥2倍均量)": [[1191, 54.2, 6.53, 5.43], [156, 43.6, -2.0, -1.86], [151, 62.3, 7.87, 3.45], [109, 58.7, 3.38, 1.54]],
+    "N字底剛形成 ＋ 虧損(無P/E) ＋ 近20日強於大盤≥10%": [[126, 46.8, 5.29, 1.63], None, None, None],
+    "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ P/E≥30倍 ＋ 量能區間低檔(≤10百分位)": [[346, 51.7, 2.52, 3.05], [60, 78.3, 13.03, 2.68], None, None],
+    "P/E≥30倍 ＋ 月營收創24個月新高 ＋ 距52週高點≤5%": [[2229, 59.3, 5.55, 7.0], [204, 55.9, 5.11, 2.12], [193, 61.1, 5.85, 3.14], [85, 51.8, 4.28, 1.02]],
+    "P/E≥30倍 ＋ 晨星剛形成 ＋ 母子懷抱(低檔)剛形成": [[153, 49.7, 3.51, 2.14], None, None, [30, 70.0, 6.23, 1.09]],
 }
 
 
