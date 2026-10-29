@@ -1408,14 +1408,6 @@ def build_condition_flags(df: pd.DataFrame):
         F['外資持股比例近20日減少≥1%'] = _col(df, 'fhChg20').le(-1)
     if has('fhHigh250'):
         F['外資持股比例創一年新高'] = eq1('fhHigh250')
-    if has('bigChg4w'):
-        F['千張大戶持股近4週增加≥1%'] = _col(df, 'bigChg4w').ge(1)
-        F['千張大戶持股近4週減少≥1%'] = _col(df, 'bigChg4w').le(-1)
-    if has('pplChg4w'):
-        F['股東人數近4週減少≥3%(籌碼集中)'] = _col(df, 'pplChg4w').le(-3)
-    if has('sblChg20'):
-        F['借券賣出餘額近20日增加≥30%'] = _col(df, 'sblChg20').ge(30)
-        F['借券賣出餘額近20日減少≥30%'] = _col(df, 'sblChg20').le(-30)
     if has('fxOI'):
         F['外資台指期淨空單≥2萬口'] = _col(df, 'fxOI').le(-20000)
         F['外資台指期淨多單'] = _col(df, 'fxOI').gt(0)
@@ -2032,8 +2024,8 @@ def val_asof(vh, ds):
 
 # ── 2026-10-22 台股新增：進階籌碼（融資融券、外資持股、千張大戶、借券賣出）＋大盤期現貨籌碼 ──
 #    籌碼資料多半在當天收盤後才公布，一律只用評估日「前一個」交易日（含）以前的資料，批次與回測一致
-CHIP2_KEYS = ('pb', 'pbPct', 'dy', 'mgChg20', 'ssRatio', 'mgUse', 'mgDownPxUp', 'fhChg20', 'fhHigh250',
-              'bigChg4w', 'pplChg4w', 'sblChg20', 'fxOI', 'mktMgChg20')
+CHIP2_KEYS = ('pb', 'pbPct', 'dy', 'mgChg20', 'ssRatio', 'mgUse', 'mgDownPxUp', 'fhChg20', 'fhHigh250', 'fxOI', 'mktMgChg20')
+# 2026-10-29：千張大戶（股權分級）、借券賣出 API 次數多、記憶體吃緊 → 不再抓取（函式保留備用）
 
 
 def _daily_series(dataset, sid, token, days_back, cols, filt=None, extra=None):
@@ -2703,7 +2695,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     inst_days = (months_back + off) * 30 + 100
     pe_days = (months_back + off) * 30 + 1095 + 20   # 本益比百分位要往前看3年
     chip_days = (months_back + off) * 30 + 400           # 進階籌碼：20日變化、一年新高
-    chip_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('margin', 'fh', 'hold', 'sbl')}
+    chip_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('margin', 'fh')}
     win_start = _ds(dt.date.today() - dt.timedelta(days=(months_back + off) * 30))
     win_end = _ds(dt.date.today() - dt.timedelta(days=off * 30)) if off else None
     fail_reasons = {}
@@ -2780,8 +2772,8 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
             except Exception:  # noqa
                 vh = None
         CH = {}
-        if include_chip2:   # 融資融券／外資持股／千張大戶／借券賣出：各自前20檔全部失敗（方案不支援）就停止抓
-            for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist), ('hold', fetch_holding_hist), ('sbl', fetch_sbl_hist)):
+        if include_chip2:   # 融資融券／外資持股：各自前20檔全部失敗（方案不支援）就停止抓
+            for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist)):
                 st_ = chip_state[k_]
                 if st_['off']:
                     continue
@@ -3746,9 +3738,6 @@ def summary_frame(results, extras_flags, K, live=None):
             rec['融資20日%'] = f1('mgChg20')
             rec['券資比%'] = f1('ssRatio')
             rec['外資持股20日變化pp'] = f1('fhChg20', 2)
-            rec['千張大戶4週變化pp'] = f1('bigChg4w', 2)
-            rec['股東人數4週%'] = f1('pplChg4w')
-            rec['借券賣出20日%'] = f1('sblChg20')
         if extras_flags.get('rev'):
             rv = r.get('revRange')
             rec['營收YoY%(最新)'] = rv[-1]['yoy'] if rv else None
@@ -4150,9 +4139,9 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
                 except Exception as ex2:  # noqa
                     extras['instRangeErr'] = str(ex2)
             c2 = dict(mcf)
-            if ex_flags.get('chip2'):   # 融資融券／外資持股／千張大戶／借券賣出（各 1 次 API）
+            if ex_flags.get('chip2'):   # 融資融券／外資持股（各 1 次 API）
                 CH = {}
-                for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist), ('hold', fetch_holding_hist), ('sbl', fetch_sbl_hist)):
+                for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist)):
                     try:
                         CH[k_] = fn_(sid, token, 400)
                     except Exception as ex3:  # noqa
@@ -4567,7 +4556,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-25 台股回測分六段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-29 進階籌碼精簡＋六段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4645,7 +4634,7 @@ def main():
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'), rev=st.checkbox('📈 近3月營收YoY/MoM', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3月均價YoY', key='x_pxyoy'),
                         inst=st.checkbox('🏦 三大法人買賣超（近3月）', key='x_inst'),
-                        chip2=st.checkbox('🧮 進階籌碼：融資融券／外資持股／千張大戶／借券（每檔多4次API）', key='x_chip2'))
+                        chip2=st.checkbox('🧮 進階籌碼：融資融券／外資持股（每檔多2次API）', key='x_chip2'))
         req_delay = st.number_input('每檔間隔秒數（避免API限速）', 0.0, 5.0, 0.6, 0.1, key='req_delay')
         st.checkbox('📌 批次分析後自動把命中組合股票加入追蹤', value=True, key='auto_track')
         run_batch = st.button('🔍 批次分析', type='primary', use_container_width=True, key='run_batch')
@@ -4687,7 +4676,7 @@ def main():
         bt_div = st.checkbox('📈 近3月YoY乖離度（股價歷史要抓超過1年）', key='bt_div')
         bt_inst = st.checkbox('🏦 三大法人買賣超（近3月）', key='bt_inst')
         bt_pe = st.checkbox('📐 本益比／淨值比位階、殖利率（P/E、P/B 近3年百分位；每檔多1次API）', value=True, key='bt_pe')
-        bt_chip2 = st.checkbox('🧮 進階籌碼：融資融券／外資持股／千張大戶／借券賣出（每檔多4次API）', value=True, key='bt_chip2',
+        bt_chip2 = st.checkbox('🧮 進階籌碼：融資融券／外資持股（每檔多2次API）', value=True, key='bt_chip2',
                                help='外資台指期未平倉、整體融資餘額整次回測只抓一次，不用另外勾。某類資料前20檔都失敗（方案不支援）會自動停止抓取')
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
         bt_delay = st.number_input('回測每檔間隔秒數', 0.0, 5.0, 0.3, 0.1, key='bt_delay')
