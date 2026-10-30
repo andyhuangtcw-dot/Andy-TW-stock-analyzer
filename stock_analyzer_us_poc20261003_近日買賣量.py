@@ -1404,6 +1404,8 @@ def build_condition_flags(df: pd.DataFrame):
     # 2026-10-22 新增：純價格的風險／時機因子（待回測驗證）
     if has('max1d20'):
         F['近20日單日最大漲幅≥10%(樂透股)'] = df['max1d20'].ge(10)
+        # 2026-10-30 全美股三份樣本交叉驗證：近20日平淡（最大單日漲幅<3%）、低特有波動三年都跑輸 → 當避開警示
+        F['近20日最大單日漲幅<3%(平淡)'] = df['max1d20'].lt(3)
     if has('ivol60'):
         F['低特有波動(年化≤20%)'] = df['ivol60'].le(20)
         F['高特有波動(年化≥60%)'] = df['ivol60'].ge(60)
@@ -2317,6 +2319,54 @@ def fetch_profile(sid, token):
     return row
 
 
+# ── 類股分類（FMP sector／industry）：快取在程式同資料夾的 JSON，同一檔只查一次；全美股清單載入時順便填入（不多花 API）──
+SECTOR_ZH = {'Technology': '科技', 'Healthcare': '醫療保健', 'Financial Services': '金融', 'Consumer Cyclical': '非必需消費',
+             'Consumer Defensive': '必需消費', 'Industrials': '工業', 'Energy': '能源', 'Basic Materials': '原物料',
+             'Utilities': '公用事業', 'Real Estate': '不動產', 'Communication Services': '通訊服務'}
+IND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'industry_cache_us.json')
+_ind_cache = None
+
+
+def _ind_load():
+    global _ind_cache
+    if _ind_cache is None:
+        try:
+            with open(IND_FILE, 'r', encoding='utf-8') as f:
+                _ind_cache = json.load(f)
+        except Exception:  # noqa
+            _ind_cache = {}
+    return _ind_cache
+
+
+def ind_save():
+    try:
+        with open(IND_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_ind_load(), f, ensure_ascii=False)
+    except Exception:  # noqa
+        pass
+
+
+def ind_put(sid, sector, industry):
+    if sector or industry:
+        _ind_load()[sid] = [sector or '', industry or '']
+
+
+def ind_label(sid):
+    v = _ind_load().get(sid)
+    if not v:
+        return ''
+    sec, ind = v
+    return f"{SECTOR_ZH.get(sec, sec)}｜{ind}" if ind else SECTOR_ZH.get(sec, sec)
+
+
+def get_industry(sid, token):
+    """類股分類文字（例：科技｜Semiconductors）；快取沒有才查 /profile（每檔一次）"""
+    if sid not in _ind_load():
+        p = fetch_profile(sid, token)
+        ind_put(sid, p.get('sector'), p.get('industry'))
+    return ind_label(sid)
+
+
 def fetch_name(sid, token, names=None):
     if names and sid in names:
         return names[sid]
@@ -2510,6 +2560,7 @@ def filter_universe_rows(rows, min_price=UNIVERSE_MIN_PRICE, min_dv=UNIVERSE_MIN
         if px and vol and dv < min_dv:
             continue
         out.append((dv, sym, r.get('companyName') or sym))
+        ind_put(sym, r.get('sector'), r.get('industry'))   # 順便記下類股分類
     out.sort(key=lambda x: -x[0])
     return [dict(id=sym, name=nm) for _, sym, nm in out[:cap]]
 
@@ -2522,6 +2573,7 @@ def fetch_market_universe(token):
     if not isinstance(j, list) or not j:
         raise RuntimeError('company-screener 回傳空清單，請確認 API Key 是否有效')
     out = filter_universe_rows(j)
+    ind_save()
     if not out:
         raise RuntimeError('company-screener 篩選後沒有股票（股價≥10、成交金額≥1000萬美元）')
     return out
@@ -3913,7 +3965,7 @@ def summary_frame(results, extras_flags, K, live=None):
         mm = matched_combos(r['row'], K['MOONSHOT_COMBOS'])
         ms = matched_combos(r['row'], K['STOCK_PICK_COMBOS'])
         rec = {
-            '股票': r['stockId'], '名稱': r['name'] + (' 🔴即時' if r.get('realtime') else ''),
+            '類股': r.get('industry') or '', '股票': r['stockId'], '名稱': r['name'] + (' 🔴即時' if r.get('realtime') else ''),
             '多方力道': r['total'], '評等': score_label(r['total']),
             '+DI': dm['plusDI'], '-DI': dm['minusDI'], 'ADX': dm['adx'], 'ADXR': dm['adxr'],
             '布林位置%': sig['bbPos'], '布林寬度%': bbw,
@@ -3929,6 +3981,13 @@ def summary_frame(results, extras_flags, K, live=None):
         rw_ = r['row']
         if isnum(rw_.get('revSurprise')) and isnum(rw_.get('earnDays')) and rw_['earnDays'] <= 63:
             rec['營收驚喜%'] = round(rw_['revSurprise'], 1)
+        # 2026-10-30 交叉驗證：低波動／近20日平淡三份樣本都跑輸（⚠️避開）；高波動飆股率約3倍但超額報酬不穩（🎲彩券，不加分）
+        vsig = []
+        if (isnum(rw_.get('ivol60')) and rw_['ivol60'] <= 30) or (isnum(rw_.get('max1d20')) and rw_['max1d20'] < 3):
+            vsig.append('⚠️平淡')
+        if (isnum(rw_.get('ivol60')) and rw_['ivol60'] >= 60) or (isnum(rw_.get('max1d20')) and rw_['max1d20'] >= 10):
+            vsig.append('🎲彩券')
+        rec['波動訊號'] = ' '.join(vsig)
         if extras_flags.get('ev'):
             rec['流通股數1年%'] = round(rw_['shsChg1y'], 1) if isnum(rw_.get('shsChg1y')) else None
             rec['近30日升/降評'] = f"↑{int(rw_['gUp30'])} ↓{int(rw_['gDn30'])}" if isnum(rw_.get('gUp30')) else '無資料'
@@ -4000,7 +4059,7 @@ def summary_frame(results, extras_flags, K, live=None):
         return df
     # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
     df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
-    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認', '財報日']
+    front = ['類股', '股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認', '財報日']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
 
@@ -4376,6 +4435,10 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
                 except Exception:  # noqa
                     pass
             r = analyze_stock(sid, fetch_name(sid, token, names), rows, bm, vpp, extras)
+            try:
+                r['industry'] = get_industry(sid, token)
+            except Exception:  # noqa
+                r['industry'] = ''
             results.append(r)
             log(f"✅ {sid} {r['name']}  得分:{r['total']}" + ('　🔴即時' if rt else ''))
         except Exception as ex:  # noqa
@@ -4384,6 +4447,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
             progress(i + 1, len(stocks))
         if i < len(stocks) - 1 and delay:
             time.sleep(delay)
+    ind_save()
     results.sort(key=lambda r: -r['total'])
     _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
     _sc = mp_load()
@@ -4788,7 +4852,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-22f 價格風險因子'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-30 波動訊號＋評等內部人無效'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4893,7 +4957,7 @@ def main():
         st.caption('以下每勾一項，每檔股票多打1次API：')
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'),
                         pt=st.checkbox('🎯 分析師目標價（上檔空間、近30日調整；每檔多1～3次API）', key='x_pt'),
-                        ev=st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～4次API）', key='x_ev'),
+                        ev=st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～4次API；⚠️三年交叉驗證無效，僅供參考）', key='x_ev'),
                         rev=st.checkbox('📈 近3季營收YoY/QoQ', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3季均價YoY', key='x_pxyoy'),
                         sector=st.checkbox('🏭 類股狀態濾網（所屬類股ETF站上/跌破20、60日均線）', key='x_sector'))
@@ -4943,7 +5007,7 @@ def main():
                               help='美股最穩定的異常之一：財報 EPS 優於預期、財報日向上跳空的股票，之後1～3個月常持續走強（PEAD）')
         bt_pt = st.checkbox('🎯 分析師目標價（price-target-news；每檔多1～15次查詢，大型股較多）', False, key='bt_pt',
                             help='目標價上檔空間≥20%／≥40%、股價高於目標價、近30日目標價上調／下調。若方案不支援，前20檔都失敗會自動停止抓取')
-        bt_ev = st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～6次查詢）', False, key='bt_ev',
+        bt_ev = st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～6次查詢；⚠️2026-10-30 交叉驗證無效，不建議勾）', False, key='bt_ev',
                             help='近30日升評／降評、近90日內部人公開市場買進（1人／≥2人）、流通股數近一年減少≥2%（庫藏股）／增加≥5%（稀釋）。營收驚喜跟財報一起抓、VIX 整次回測抓一次，都不用另外勾')
         bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
@@ -5131,7 +5195,7 @@ def render_batch(st, ss, K):
                 st.success(f"✅ 已加入「{_ln}」：新增 {_n} 檔（重複的略過），清單共 {len(ss['lists'][_ln])} 檔")
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
-        st.caption('S＝選股型：2023-10～2026-09 美股三年回測（分六個半年），每一年扣掉同一天大盤後都仍有超額報酬（依日 t≥2）、六個半年至少五個為正，最值得看（約每20日 +1.0～1.5%）。'
+        st.caption('S＝選股型：2023-10～2026-09 美股三年回測（分六個半年），每一年扣掉同一天大盤後都仍有超額報酬（依日 t≥2）、六個半年至少五個為正，最值得看（約每20日 +1.0～1.5%）；S6～S8 為 2026-10-22 用全美股2000-B 新增（含高特有波動／高Beta／類股動能，波動較大，S8 需勾類股濾網）。'
                    '#＝高勝率；標 ⏱ 的是擇時型（含布林低檔／大盤或類股跌破均線），勝率主要來自大盤反彈，適合判斷大盤落底，不適合當選股依據。'
                    '⚠️ #、M 的歷史統計是 2026-09-21 美股回測（舊版分價量表、夜星未限高檔）記錄的。')
         t0 = pd.DataFrame([{'編號': f'S{i + 1}', '條件組合': '＋'.join(c),
@@ -6209,6 +6273,10 @@ STOCK_PICK_COMBOS = [
     ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "中期強勢(12-1月勝大盤≥20%)", "CMF資金流買方佔優(近20日≥0.1)"],
     ["近20日強於大盤≥10%", "大盤站上20日均線", "創52週新高"],
 
+    # 2026-10-22 新增（全美股2000-B 三年六段：三年依日 t 都≥3、六個半年都為正；扣掉現有 S 命中後仍有超額）
+    ["高特有波動(年化≥60%)", "近1季財報EPS大幅優於預期(≥10%)", "漲時量≥跌時量1.5倍(近20日)"],
+    ["高Beta(>1.5)", "布林通道高檔(≥80%)", "CMF資金流買方佔優(近20日≥0.1)"],
+    ["所屬類股近6個月弱於大盤", "近1季財報EPS優於預期", "中期強勢(12-1月勝大盤≥20%)"],
 ]
 STOCK_PICK_STATS = {
     "近1季財報EPS大幅優於預期(≥10%) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 29516, "win": 55.6, "ret": 1.35, "ex": 0.81, "t": 16.0}, "20": {"n": 29516, "win": 56.3, "ret": 2.65, "ex": 1.36, "t": 18.35}},
@@ -6217,6 +6285,9 @@ STOCK_PICK_STATS = {
     "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 7437, "win": 54.5, "ret": 1.2, "ex": 0.63, "t": 6.62}, "20": {"n": 7437, "win": 56.6, "ret": 2.47, "ex": 1.26, "t": 9.02}},
     "近20日強於大盤≥10% ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 17466, "win": 52.6, "ret": 0.74, "ex": 0.59, "t": 9.44}, "20": {"n": 17466, "win": 51.9, "ret": 1.38, "ex": 1.1, "t": 12.02}},
 
+    "高特有波動(年化≥60%) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 漲時量≥跌時量1.5倍(近20日)": {"10": {"n": 6481, "win": 54.8, "ret": 1.84, "ex": 1.28, "t": 5.59}, "20": {"n": 6481, "win": 55.3, "ret": 3.58, "ex": 2.49, "t": 9.25}},
+    "高Beta(>1.5) ＋ 布林通道高檔(≥80%) ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 12107, "win": 54.9, "ret": 1.78, "ex": 1.27, "t": 6.38}, "20": {"n": 12107, "win": 54.7, "ret": 2.92, "ex": 1.93, "t": 7.89}},
+    "所屬類股近6個月弱於大盤 ＋ 近1季財報EPS優於預期 ＋ 中期強勢(12-1月勝大盤≥20%)": {"10": {"n": 38039, "win": 54.7, "ret": 1.3, "ex": 0.73, "t": 7.96}, "20": {"n": 38039, "win": 55.5, "ret": 2.66, "ex": 1.54, "t": 12.31}},
 }
 # 2026-09-27 美股回測（勝率榜5/10/20日＋飆股榜5/10/20日）中，指定組合的勝率／t值(同日調整)／飆股比例記錄值
 # key＝條件依字元排序後以「 ＋ 」連接
@@ -7656,6 +7727,9 @@ REGIME_STATS = {
     "OBV能量潮創60日新高 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1680, 48.9, 1.26, 2.58], [201, 35.3, -6.2, -1.93], [38, 86.8, 10.04, 2.36], [124, 53.2, 1.9, 0.58]],
     "OBV能量潮創60日新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[2980, 51.6, 1.75, 4.09], [332, 41.6, -3.7, -1.74], [44, 70.5, 2.22, 0.48], [207, 48.3, 0.23, -0.99]],
     "中期強勢(12-1月勝大盤≥20%) ＋ 目標價上檔空間≥40%": [[1573, 54.4, 1.43, 2.36], [493, 57.4, 2.8, 2.28], [51, 86.3, 9.53, 3.56], [728, 71.6, 5.55, 7.02]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 高特有波動(年化≥60%)": [[4918, 55.6, 2.75, 8.67], [868, 52.0, 0.37, 2.28], [110, 70.9, 9.8, 3.21], [585, 54.2, 2.03, 1.73]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 布林通道高檔(≥80%) ＋ 高Beta(>1.5)": [[10578, 54.9, 2.01, 7.49], [742, 47.2, -1.62, -0.04], [278, 74.8, 8.93, 4.75], [509, 49.3, 1.62, 3.38]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 所屬類股近6個月弱於大盤 ＋ 近1季財報EPS優於預期": [[25806, 53.3, 1.17, 8.87], [5481, 59.1, 1.54, 5.37], [823, 61.2, 4.21, 3.94], [5929, 61.2, 2.8, 6.33]],
 }
 
 
