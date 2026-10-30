@@ -1165,6 +1165,23 @@ def tech_extras(b, e):
     if e >= 6:
         rg = [b.high[j] - b.low[j] for j in range(e - 6, e + 1)]
         out['nr7'] = int(rg[-1] < min(rg[:-1]))
+    # 2026-10-30 新增價格因子（不需額外API，待回測驗證）：60日年化波動率、近20日單日最大漲幅、距52週低點、
+    # 中期動能（近12個月扣最近1個月）、近20日平均成交金額（億元）
+    out.update(dict(vol60=None, maxRet20=None, low52Dist=None, mom12_1=None, amt20=None))
+    if e >= 60:
+        rr = [b.close[j] / b.close[j - 1] - 1 for j in range(e - 59, e + 1) if b.close[j - 1] > 0]
+        if len(rr) >= 50:
+            mu = sum(rr) / len(rr)
+            out['vol60'] = math.sqrt(sum((x - mu) ** 2 for x in rr) / (len(rr) - 1)) * math.sqrt(250) * 100
+    if e >= 20:
+        rr = [b.close[j] / b.close[j - 1] - 1 for j in range(e - 19, e + 1) if b.close[j - 1] > 0]
+        out['maxRet20'] = max(rr) * 100 if rr else None
+        out['amt20'] = sum(b.close[j] * b.volume[j] for j in range(e - 19, e + 1)) / 20 / 1e8
+    if e >= 249:
+        mn = min(b.low[e - 249:e + 1])
+        out['low52Dist'] = (b.close[e] / mn - 1) * 100 if mn > 0 else None
+        if b.close[e - 249] > 0:
+            out['mom12_1'] = (b.close[e - 21] / b.close[e - 249] - 1) * 100
     return out
 
 
@@ -1267,6 +1284,16 @@ NEW_TECH_FLAGS = [
     ('pullMa60', '多頭回測季線(季線上揚、距季線±3%)', lambda s: s.eq(1)),
     ('bias20', '短線過熱(高於月線≥20%)', lambda s: s.ge(20)),
     ('limitUp3', '近3日漲停', lambda s: s.eq(1)),
+    # 2026-10-30 新增價格因子（待回測驗證）
+    ('vol60', '高波動(60日年化≥60%)', lambda s: s.ge(60)),
+    ('vol60', '低波動(60日年化≤25%)', lambda s: s.le(25)),
+    ('maxRet20', '近20日曾單日大漲≥9.5%', lambda s: s.ge(9.5)),
+    ('low52Dist', '距52週低點≤10%', lambda s: s.le(10)),
+    ('low52Dist', '自52週低點漲≥100%', lambda s: s.ge(100)),
+    ('mom12_1', '中期動能強(近12月扣近1月≥50%)', lambda s: s.ge(50)),
+    ('mom12_1', '中期動能弱(近12月扣近1月≤-20%)', lambda s: s.le(-20)),
+    ('amt20', '成交金額大(20日均≥20億)', lambda s: s.ge(20)),
+    ('amt20', '成交金額小(20日均<0.5億)', lambda s: s.lt(0.5)),
 ]
 # 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
 SEARCH_EXCLUDE_FLAGS = {'型態成形中', '型態突破確認', '型態剛形成(剛突破)', '突破上升軌道線剛形成',
@@ -1408,9 +1435,7 @@ def build_condition_flags(df: pd.DataFrame):
         F['外資持股比例近20日減少≥1%'] = _col(df, 'fhChg20').le(-1)
     if has('fhHigh250'):
         F['外資持股比例創一年新高'] = eq1('fhHigh250')
-    if has('fxOI'):
-        F['外資台指期淨空單≥2萬口'] = _col(df, 'fxOI').le(-20000)
-        F['外資台指期淨多單'] = _col(df, 'fxOI').gt(0)
+    # 2026-10-30：外資台指期淨空單≥2萬口／淨多單兩個條件拿掉（淨空單80%的日子都觸發、淨多單三年只有24天，都沒有鑑別力）
     if has('mktMgChg20'):
         F['整體融資近20日增加≥8%'] = _col(df, 'mktMgChg20').ge(8)
         F['整體融資近20日減少≥8%'] = _col(df, 'mktMgChg20').le(-8)
@@ -1743,7 +1768,7 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
 # 「出現在大盤反彈的日子」（2026-09-27 台股回測：扣掉同日大盤後超額報酬≈0），
 # 適合拿來判斷大盤是否落底，不適合當選股依據。
 TIMING_FACTORS = {'布林通道低檔(≤20%)', '大盤跌破20日均線', '大盤跌破60日均線', '類股跌破20日均線', '類股跌破60日均線',
-                  '外資台指期淨空單≥2萬口', '外資台指期淨多單', '整體融資近20日增加≥8%', '整體融資近20日減少≥8%'}
+                  '整體融資近20日增加≥8%', '整體融資近20日減少≥8%'}
 
 
 def is_timing_combo(combo):
@@ -3117,7 +3142,7 @@ def market_panel_lines(results, K):
             t_.append(f"外資台指期淨{'多' if mc['fxOI'] > 0 else '空'}單 **{abs(mc['fxOI']):,.0f} 口**")
         if mc.get('mktMgChg20') is not None:
             t_.append(f"整體融資近20日 **{mc['mktMgChg20']:+.1f}%**")
-        lines.append('📊 期現貨籌碼：' + '、'.join(t_) + '（外資淨空單≥2萬口、融資20日±8% 已加入回測條件，待驗證後再納入建議持股）')
+        lines.append('📊 期現貨籌碼：' + '、'.join(t_) + '（僅供參考：三年回測台指期未平倉、整體融資對大盤擇時都沒有穩定效果，不納入建議持股）')
     _mpl = mp_panel_line(next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))
     if _mpl:
         lines.append(_mpl)
@@ -3738,6 +3763,13 @@ def summary_frame(results, extras_flags, K, live=None):
             rec['融資20日%'] = f1('mgChg20')
             rec['券資比%'] = f1('ssRatio')
             rec['外資持股20日變化pp'] = f1('fhChg20', 2)
+            # 2026-10-30 三年回測：外資持股增加≥1%／融資增加≥20% 疊加在強勢條件上全部加分；減少則多數扣分（可當避開警示）
+            sig = []
+            if isnum(rw2.get('fhChg20')) and rw2['fhChg20'] >= 1: sig.append('✅外資增')
+            if isnum(rw2.get('mgChg20')) and rw2['mgChg20'] >= 20: sig.append('✅融資增')
+            if isnum(rw2.get('fhChg20')) and rw2['fhChg20'] <= -1: sig.append('⚠️外資減')
+            if isnum(rw2.get('mgChg20')) and rw2['mgChg20'] <= -20: sig.append('⚠️融資減')
+            rec['籌碼訊號'] = ' '.join(sig)
         if extras_flags.get('rev'):
             rv = r.get('revRange')
             rec['營收YoY%(最新)'] = rv[-1]['yoy'] if rv else None
@@ -4556,7 +4588,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-29 進階籌碼精簡＋六段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-10-30 價格因子'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -8510,6 +8542,12 @@ BT_HOT_COMBOS = [
     ["P/E≥30倍", "量能區間低檔(≤10百分位)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
     ["P/E≥30倍", "距52週高點≤5%", "月營收創24個月新高"],
     ["P/E≥30倍", "母子懷抱(低檔)剛形成", "晨星剛形成"],
+    # 2026-10-30 台股三年六段回測（含進階籌碼）新增：外資持股／融資增加疊加強勢股，三年飆股比例都≥2倍基準（勝率約46~51%，跌>10%約25~30%）
+    ["融資近20日增加≥20%", "短線過熱(高於月線≥20%)"],
+    ["外資持股比例近20日增加≥1%", "短線過熱(高於月線≥20%)"],
+    ["外資持股比例近20日增加≥1%", "近3日漲停"],
+    ["融資近20日增加≥20%", "近3日漲停"],
+    ["外資持股比例創一年新高", "融資使用率≥30%"],
 ]
 BT_HOT_STATS = {
     "MACD近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 三大法人近3月賣超": {"10": {"n": 167, "moonshotN": 20, "pct": 12.0, "avg": 50.4}, "20": {"n": 167, "moonshotN": 21, "pct": 12.6, "avg": 65.7}},
@@ -8832,6 +8870,11 @@ BT_HOT_STATS = {
     "P/E≥30倍 ＋ 量能區間低檔(≤10百分位) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 441, "moonshotN": 24, "pct": 5.4, "avg": 42.2}, "20": {"n": 441, "moonshotN": 66, "pct": 15.0, "avg": 48.1}},
     "P/E≥30倍 ＋ 距52週高點≤5% ＋ 月營收創24個月新高": {"10": {"n": 2711, "moonshotN": 178, "pct": 6.6, "avg": 42.9}, "20": {"n": 2711, "moonshotN": 406, "pct": 15.0, "avg": 50.2}},
     "P/E≥30倍 ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 214, "moonshotN": 15, "pct": 7.0, "avg": 44.7}, "20": {"n": 214, "moonshotN": 32, "pct": 15.0, "avg": 46.9}},
+    "融資近20日增加≥20% ＋ 短線過熱(高於月線≥20%)": {"10": {"n": 5581, "moonshotN": 421, "pct": 7.5, "avg": 44.1}, "20": {"n": 5581, "moonshotN": 826, "pct": 14.8, "avg": 52.2}},
+    "外資持股比例近20日增加≥1% ＋ 短線過熱(高於月線≥20%)": {"10": {"n": 5008, "moonshotN": 341, "pct": 6.8, "avg": 44.4}, "20": {"n": 5008, "moonshotN": 734, "pct": 14.7, "avg": 51.4}},
+    "外資持股比例近20日增加≥1% ＋ 近3日漲停": {"10": {"n": 7458, "moonshotN": 517, "pct": 6.9, "avg": 46.3}, "20": {"n": 7458, "moonshotN": 990, "pct": 13.3, "avg": 53.3}},
+    "融資近20日增加≥20% ＋ 近3日漲停": {"10": {"n": 7782, "moonshotN": 553, "pct": 7.1, "avg": 45.6}, "20": {"n": 7782, "moonshotN": 1014, "pct": 13.0, "avg": 52.7}},
+    "外資持股比例創一年新高 ＋ 融資使用率≥30%": {"10": {"n": 670, "moonshotN": 47, "pct": 7.0, "avg": 45.6}, "20": {"n": 670, "moonshotN": 87, "pct": 13.0, "avg": 48.8}},
 }
 BT_HIT_SHOW = 3   # 摘要表每類最多顯示幾個編號，其餘以「+N」表示
 
