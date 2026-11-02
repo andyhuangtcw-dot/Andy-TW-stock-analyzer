@@ -1212,7 +1212,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
         row.update(mid_momentum(b, e, bm))
         row.update(risk_feats(b, e, bm))
     row['secMom'] = sector_mom(sb, bm, b.date[e])
-    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS:
+    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS + FQ_KEYS:
         if k in ex:
             row[k] = ex[k]
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -1388,6 +1388,29 @@ def build_condition_flags(df: pd.DataFrame):
         F['近1季營收低於預期'] = rsp.lt(0) & red
         if has('epsSurprise'):
             F['近1季EPS與營收雙優於預期'] = df['epsSurprise'].gt(0) & rsp.gt(0) & red
+    # 2026-11-02 新增：財報品質＋P/E 位階（待回測驗證）
+    if has('pePct'):
+        F['P/E近3年低檔(≤20%)'] = df['pePct'].le(20)
+        F['P/E近3年高檔(≥80%)'] = df['pePct'].ge(80)
+    if has('pe'):
+        F['P/E<15倍'] = df['pe'].gt(0) & df['pe'].lt(15)
+        F['P/E≥40倍'] = df['pe'].ge(40)
+    if has('peLoss'):
+        F['近四季虧損(EPS合計≤0)'] = df['peLoss'].eq(1)
+    if has('roe'):
+        F['ROE≥20%(近四季)'] = df['roe'].ge(20)
+        F['ROE<5%(近四季)'] = df['roe'].lt(5)
+    if has('gmYoY'):
+        F['毛利率年增≥2pp(最新季)'] = df['gmYoY'].ge(2)
+        F['毛利率年減≥2pp(最新季)'] = df['gmYoY'].le(-2)
+    if has('gmUp2'):
+        F['毛利率連2季年增'] = df['gmUp2'].eq(1)
+    if has('fcfYld'):
+        F['自由現金流殖利率≥5%'] = df['fcfYld'].ge(5)
+        F['自由現金流為負(近四季)'] = df['fcfYld'].lt(0)
+    if has('accr'):
+        F['應計比率高(盈餘品質差，≥5%)'] = df['accr'].ge(5)
+        F['應計比率低(現金流>盈餘，≤-5%)'] = df['accr'].le(-5)
     if has('shsChg1y'):
         F['流通股數近一年減少≥2%(庫藏股)'] = df['shsChg1y'].le(-2)
         F['流通股數近一年增加≥5%(稀釋)'] = df['shsChg1y'].ge(5)
@@ -2153,6 +2176,116 @@ def shares_feats(ds, hist, inclusive=False):
     return {'shsChg1y': chg if abs(chg) <= 40 else None}   # 超過±40%多半是分割／反分割（股數沒還原），不算
 
 
+# ── 2026-11-02 美股新增：財報品質＋P/E 位階（季報 income／balance／cash-flow，都用 filingDate「當時已公布」）──
+FQ_KEYS = ('pe', 'pePct', 'peLoss', 'roe', 'gmYoY', 'gmUp2', 'fcfYld', 'accr')
+
+
+def _fq_num(r, *ks):
+    for k in ks:
+        try:
+            v = float(r.get(k))
+            if math.isfinite(v):
+                return v
+        except Exception:  # noqa
+            pass
+    return None
+
+
+def fetch_fin_hist(sid, token, limit=24):
+    """三張季報合併 → 依期末日排序的 [{av 可得日, d 期末日, eps, ni, rev, gp, sh, eq, ta, ocf, capex}]；每檔 3 次查詢"""
+    sym = to_fmp_symbol(sid)
+    inc = fmp_get('/income-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    bal = fmp_get('/balance-sheet-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    cf = fmp_get('/cash-flow-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    q = {}
+    for src, fn in ((inc, lambda r: dict(eps=_fq_num(r, 'epsDiluted', 'epsdiluted', 'eps'), ni=_fq_num(r, 'netIncome'),
+                                          rev=_fq_num(r, 'revenue'), gp=_fq_num(r, 'grossProfit'),
+                                          sh=_fq_num(r, 'weightedAverageShsOutDil', 'weightedAverageShsOut'))),
+                    (bal, lambda r: dict(eq=_fq_num(r, 'totalStockholdersEquity', 'totalEquity'), ta=_fq_num(r, 'totalAssets'))),
+                    (cf, lambda r: dict(ocf=_fq_num(r, 'operatingCashFlow', 'netCashProvidedByOperatingActivities'),
+                                        capex=_fq_num(r, 'capitalExpenditure')))):
+        for r in src if isinstance(src, list) else []:
+            d = str(r.get('date') or '')[:10]
+            if len(d) < 10:
+                continue
+            fd = str(r.get('filingDate') or r.get('acceptedDate') or '')[:10]
+            av = fd if len(fd) == 10 else _ds(dt.date.fromisoformat(d) + dt.timedelta(days=45))
+            x = q.setdefault(d, dict(d=d, av=av))
+            x['av'] = max(x['av'], av)
+            x.update({k: v for k, v in fn(r).items() if v is not None})
+    return sorted(q.values(), key=lambda x: x['d'])
+
+
+def _ttm(qs, k):
+    v = [x.get(k) for x in qs[-4:]]
+    return sum(v) if len(v) == 4 and all(a is not None for a in v) else None
+
+
+def fin_feats_series(b, hist, inclusive=False):
+    """每根K棒「當時已公布」的近四季：回傳 (pe 陣列, 取特徵的函式 f(e))；P/E＝收盤 ÷ 近四季 EPS 合計"""
+    n = b.n
+    hist = sorted(hist or [], key=lambda x: x['av'])
+    pe = [None] * n
+    known_at = [None] * n
+    j, known, ks, eps = 0, [], None, None
+    for e in range(n):
+        ds = b.date[e]
+        grew = False
+        while j < len(hist) and (hist[j]['av'] <= ds if inclusive else hist[j]['av'] < ds):
+            known.append(hist[j])
+            j += 1
+            grew = True
+        if grew:   # 有新季報才重算（同一份清單給之後每根K棒共用）
+            ks = sorted(known, key=lambda x: x['d'])
+            eps = _ttm(ks, 'eps')
+        if ks:
+            known_at[e] = ks
+            if eps is not None and eps > 0 and b.close[e]:
+                pe[e] = b.close[e] / eps
+    def f(e):
+        out = dict.fromkeys(FQ_KEYS)
+        ks = known_at[e]
+        if not ks:
+            return out
+        eps = _ttm(ks, 'eps')
+        if eps is not None:
+            out['peLoss'] = int(eps <= 0)
+            out['pe'] = pe[e]
+        if pe[e] is not None:
+            win = [v for v in pe[max(0, e - 750):e + 1] if v is not None]
+            if len(win) >= 250:
+                out['pePct'] = sum(1 for v in win if v <= pe[e]) / len(win) * 100
+        ni, ocf, cap = _ttm(ks, 'ni'), _ttm(ks, 'ocf'), _ttm(ks, 'capex')
+        last = ks[-1]
+        eq, ta, sh = last.get('eq'), last.get('ta'), last.get('sh')
+        if ni is not None and eq and eq > 0:
+            out['roe'] = ni / eq * 100
+        if ocf is not None and cap is not None and sh and b.close[e]:
+            out['fcfYld'] = (ocf - abs(cap)) / (sh * b.close[e]) * 100
+        if ni is not None and ocf is not None and ta and ta > 0:
+            out['accr'] = (ni - ocf) / ta * 100
+
+        def gm(x):
+            return x['gp'] / x['rev'] * 100 if x.get('gp') is not None and x.get('rev') else None
+
+        def yoy(i):   # 第 i 季（-1＝最新）毛利率比一年前同季（期末日差 300～430 天）
+            if len(ks) < -i:
+                return None
+            cur = ks[i]
+            d1 = dt.date.fromisoformat(cur['d'])
+            old = [x for x in ks if 300 <= (d1 - dt.date.fromisoformat(x['d'])).days <= 430]
+            if not old or gm(cur) is None:
+                return None
+            o = min(old, key=lambda x: abs((d1 - dt.date.fromisoformat(x['d'])).days - 365))
+            return gm(cur) - gm(o) if gm(o) is not None else None
+        g1, g2 = yoy(-1), yoy(-2)
+        out['gmYoY'] = g1
+        if g1 is not None and g2 is not None:
+            out['gmUp2'] = int(g1 > 0 and g2 > 0)
+        return out
+    return pe, f
+
+
 def fetch_grades_hist(sid, token):
     """/grades 評等異動 → [{date, firm, act}]；act：+1 升評、-1 降評、0 維持／新增"""
     j = fmp_get('/grades', dict(symbol=to_fmp_symbol(sid), limit=1000), token)
@@ -2879,13 +3012,14 @@ def prep_analysis_df(df, min_px=10.0, wq=0.01):
 
 def run_backtest(token, universe, months_back, include_div, include_sector, min_liq, vp_params,
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
-                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False):
+                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False,
+                 include_fq=False):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
     universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
     buf = 60
     maxh = max(HORIZONS)
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
-    price_days = (months_back + off) * 30 + buf + maxh + 10 + 400   # +400天：52週高點、布林收窄需要約一年歷史（營收乖離也夠用）
+    price_days = (months_back + off) * 30 + buf + maxh + 10 + (1100 if include_fq else 400)   # +400天：52週高點、布林收窄需要約一年歷史；P/E 近3年位階要 +1100 天
     q_back = math.ceil((months_back + off) / 3) + 5
     bm_err = None
     try:
@@ -2899,6 +3033,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     total = len(universe)
     vx = locals().get('vx')
     ev_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('shares', 'grades', 'insider')}
+    fq_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 財報品質／P/E：前20檔全部失敗（方案不支援季報）就停止抓
     pt_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 前20檔目標價全部失敗（方案不支援）→ 之後不再抓，省API
     pt_lock = threading.Lock()
 
@@ -2965,6 +3100,18 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                             stt_['err'] = str(ex_)[:150]
                             if stt_['ok'] == 0 and stt_['fail'] >= 20:
                                 stt_['off'] = True
+            fqf = None
+            if include_fq and not fq_state['off']:
+                try:
+                    _, fqf = fin_feats_series(b, fetch_fin_hist(sid, token, limit=math.ceil((months_back + off) / 3) + 20))
+                    with pt_lock:
+                        fq_state['ok'] += 1
+                except Exception as ex_:  # noqa
+                    with pt_lock:
+                        fq_state['fail'] += 1
+                        fq_state['err'] = str(ex_)[:150]
+                        if fq_state['ok'] == 0 and fq_state['fail'] >= 20:
+                            fq_state['off'] = True
             pc = PatternCache(b)
             recs = []
             for e in range(buf, ev_end):
@@ -2993,6 +3140,8 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                     ex.update(insider_feats(ds, evh['insider']))
                 if vx:
                     ex['vix'] = vix_asof(vx, ds)
+                if fqf:
+                    ex.update(fqf(e))
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
                 ec = b.close[e]
                 row['entryClose'] = ec
@@ -3107,9 +3256,11 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     ev_err = '；'.join(f"{dict(shares='流通股數', grades='評等升降', insider='內部人交易')[k]} {v['fail']} 檔抓取失敗"
                        + ('（前20檔全部失敗已停止）' if v['off'] else '') + f"：{v['err']}"
                        for k, v in ev_state.items() if include_ev and v['fail']) or None
+    fq_err = (f"財報品質／P/E（季報三張表）{fq_state['fail']} 檔抓取失敗" + ('，前20檔全部失敗已停止抓取' if fq_state['off'] else '')
+              + f"：{fq_state['err']}") if include_fq and fq_state['fail'] else None
     pt_err = (f"目標價（price-target-news）{pt_state['fail']} 檔抓取失敗" + ('，前20檔全部失敗已停止抓取' if pt_state['off'] else '')
               + f"：{pt_state['err']}") if include_pt and pt_state['fail'] else None
-    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err, ev_err=ev_err,
+    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err, ev_err=ev_err, fq_err=fq_err,
                     vix_err=None if vx else 'VIX（^VIX）抓不到，VIX 條件這次不會出現',
                     top_fail=[f'{m}（{c}次）' for m, c in top])
 
@@ -4048,6 +4199,16 @@ def summary_frame(results, extras_flags, K, live=None):
             rec['流通股數1年%'] = round(rw_['shsChg1y'], 1) if isnum(rw_.get('shsChg1y')) else None
             rec['近30日升/降評'] = f"↑{int(rw_['gUp30'])} ↓{int(rw_['gDn30'])}" if isnum(rw_.get('gUp30')) else '無資料'
             rec['近90日內部人買進'] = (f"{int(rw_['insBuyN90'])}人 ${rw_['insBuyVal90'] / 1e6:.2f}M" if rw_['insBuyN90'] else '0') if isnum(rw_.get('insBuyN90')) else '無資料'
+        if extras_flags.get('fq'):
+            f1 = lambda k, d=1: round(rw_[k], d) if isnum(rw_.get(k)) else None
+            rec['P/E(近四季)'] = f1('pe') if rw_.get('peLoss') != 1 else '虧損'
+            rec['P/E近3年百分位'] = f1('pePct', 0)
+            rec['ROE%'] = f1('roe')
+            rec['毛利率年增pp'] = f1('gmYoY')
+            rec['FCF殖利率%'] = f1('fcfYld')
+            rec['應計比率%'] = f1('accr')
+            if not any(isnum(rw_.get(k)) for k in ('pe', 'roe', 'gmYoY', 'fcfYld')) and r.get('fqErr'):
+                rec['ROE%'] = '⚠️ 讀取失敗'
         if extras_flags.get('pt'):
             pi = r.get('ptInfo') or {}
             up = pi.get('ptUpside')
@@ -4429,7 +4590,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
     results = []
     for i, sid in enumerate(stocks):
         try:
-            rows_full = fetch_price(sid, token, max(days, LONG_HISTORY_DAYS))
+            rows_full = fetch_price(sid, token, max(days, 1150 if ex_flags.get('fq') else LONG_HISTORY_DAYS))   # P/E 近3年位階要約3年股價
             rt = False
             if use_rt:
                 rows_full, rt = merge_realtime_quote(rows_full, fetch_quote(sid, token))
@@ -4453,6 +4614,11 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
                     extras['peRangeErr'] = str(ex2)
             if vx_live:
                 tech['vix'] = vx_live[1][-1]
+            if ex_flags.get('fq'):   # 財報品質＋P/E 位階（季報三張表，用已公布的最新四季）
+                try:
+                    tech.update(fin_feats_series(bl, fetch_fin_hist(sid, token, limit=16), inclusive=True)[1](bl.n - 1))
+                except Exception as ex2:  # noqa
+                    extras['fqErr'] = str(ex2)[:150]
             if ex_flags.get('ev'):   # 評等升降／內部人買進／流通股數（各 1 次 API，內部人可能 1～2 次）
                 td_ = _ds(dt.date.today())
                 for fn_ in (lambda: shares_feats(td_, fetch_shares_hist(sid, token, limit=8), True),
@@ -4912,7 +5078,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-02 M／#清單精簡＋目標價無效'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-02 財報品質＋P/E位階'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -5018,6 +5184,7 @@ def main():
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'),
                         pt=st.checkbox('🎯 分析師目標價（上檔空間、近30日調整；每檔多1～3次API）', key='x_pt'),
                         ev=st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～4次API；⚠️三年交叉驗證無效，僅供參考）', key='x_ev'),
+                        fq=st.checkbox('💎 財報品質＋P/E位階（ROE、毛利率、自由現金流、應計比率、P/E近3年百分位；每檔多3次API）', key='x_fq'),
                         rev=st.checkbox('📈 近3季營收YoY/QoQ', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3季均價YoY', key='x_pxyoy'),
                         sector=st.checkbox('🏭 類股狀態濾網（所屬類股ETF站上/跌破20、60日均線）', key='x_sector'))
@@ -5069,6 +5236,9 @@ def main():
                             help='⚠️ 2026-11-02 全美股中小型股三年驗證：沒有一項三年都 t≥2（上檔空間大的偏彩券、跌>10%約19%），不建議勾。目標價上檔空間≥20%／≥40%、股價高於目標價、近30日目標價上調／下調。若方案不支援，前20檔都失敗會自動停止抓取')
         bt_ev = st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～6次查詢；⚠️2026-10-30 交叉驗證無效，不建議勾）', False, key='bt_ev',
                             help='近30日升評／降評、近90日內部人公開市場買進（1人／≥2人）、流通股數近一年減少≥2%（庫藏股）／增加≥5%（稀釋）。營收驚喜跟財報一起抓、VIX 整次回測抓一次，都不用另外勾')
+        bt_fq = st.checkbox('💎 財報品質＋P/E位階（季報三張表；每檔多3次查詢，股價多抓約2年）', False, key='bt_fq',
+                            help='2026-11-02 新增（待回測驗證）：P/E 在自己近3年的百分位、P/E<15／≥40倍、近四季虧損、ROE、毛利率年增／連2季年增、'
+                                 '自由現金流殖利率、應計比率（淨利−營業現金流）÷總資產。全部用 filingDate 當時已公布的季報。方案不支援季報時，前20檔都失敗會自動停止抓')
         bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
         bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
@@ -5175,14 +5345,15 @@ def main():
                             + (f'　｜{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp,
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx),
-                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev)
+                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev,
+                                   include_fq=bt_fq)
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             if stt.get('stopped'):
                 st.warning(f"⚠️ 回測提前結束：{stt['stopped']}")
             if stt.get('pt_err'):
                 st.warning('⚠️ ' + stt['pt_err'])
-            for k_ in ('ev_err', 'vix_err'):
+            for k_ in ('ev_err', 'fq_err', 'vix_err'):
                 if stt.get(k_):
                     st.warning('⚠️ ' + stt[k_])
             if stt.get('bm_err'):
