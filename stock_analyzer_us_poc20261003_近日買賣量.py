@@ -4207,6 +4207,14 @@ def summary_frame(results, extras_flags, K, live=None):
             rec['毛利率年增pp'] = f1('gmYoY')
             rec['FCF殖利率%'] = f1('fcfYld')
             rec['應計比率%'] = f1('accr')
+            # 2026-11-03 三年回測：毛利率年增≥2pp 三年都有效（疊加強勢條件全部加分）、年減偏負；虧損／FCF為負／低ROE 飆股率2～3倍但跌>10%約兩成
+            fs = []
+            if isnum(rw_.get('gmYoY')) and rw_['gmYoY'] >= 2: fs.append('✅毛利率年增')
+            elif rw_.get('gmUp2') == 1: fs.append('✅毛利率連2季增')
+            if isnum(rw_.get('gmYoY')) and rw_['gmYoY'] <= -2: fs.append('⚠️毛利率年減')
+            if rw_.get('peLoss') == 1 or (isnum(rw_.get('fcfYld')) and rw_['fcfYld'] < 0) or (isnum(rw_.get('roe')) and rw_['roe'] < 5):
+                fs.append('🎲' + ('虧損' if rw_.get('peLoss') == 1 else 'FCF為負' if (isnum(rw_.get('fcfYld')) and rw_['fcfYld'] < 0) else '低ROE'))
+            rec['財報訊號'] = ' '.join(fs)
             if not any(isnum(rw_.get(k)) for k in ('pe', 'roe', 'gmYoY', 'fcfYld')) and r.get('fqErr'):
                 rec['ROE%'] = '⚠️ 讀取失敗'
         if extras_flags.get('pt'):
@@ -5078,7 +5086,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-02 財報品質＋P/E位階'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-03 財報訊號'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
