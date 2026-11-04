@@ -2708,6 +2708,45 @@ def load_bt_files(files):
 BT_SEG_MONTHS = 6   # 三年分六段：每段半年（一年一段資料量大，加上進階籌碼後容易超過 Streamlit Cloud 記憶體）
 BT_SEG_OPTIONS = ['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
 
+EXIT_KEYS = ('mdd20', 'mfu20', 'ret60d', 'xStop8', 'xTp20', 'xSt8Tp20', 'xTrail10')
+
+
+def exit_feats(b, e):
+    """2026-11-03 出場規則回測：進場（評估日收盤）後的路徑。全部是 % 報酬：
+    mdd20／mfu20＝20日內最低價／最高價相對進場價；ret60d＝持有60日；
+    xStop8＝20日內跌破 −8% 就停損（以 −8% 計），否則抱滿20日；xTp20＝20日內漲到 +20% 就停利，否則抱滿20日；
+    xSt8Tp20＝兩者都設（同一天都碰到時保守當作先停損）；xTrail10＝收盤自進場後最高收盤回落10%就出場，否則抱滿20日"""
+    out = dict.fromkeys(EXIT_KEYS)
+    ec = b.close[e]
+    if not ec or e + 20 >= b.n:
+        return out
+    lo = [b.low[j] / ec - 1 for j in range(e + 1, e + 21)]
+    hi = [b.high[j] / ec - 1 for j in range(e + 1, e + 21)]
+    r20 = b.close[e + 20] / ec - 1
+    out['mdd20'], out['mfu20'] = min(lo) * 100, max(hi) * 100
+    if e + 60 < b.n:
+        out['ret60d'] = (b.close[e + 60] / ec - 1) * 100
+    ds = next((k for k, v in enumerate(lo) if v <= -0.08), None)
+    dt_ = next((k for k, v in enumerate(hi) if v >= 0.20), None)
+    out['xStop8'] = -8.0 if ds is not None else r20 * 100
+    out['xTp20'] = 20.0 if dt_ is not None else r20 * 100
+    if ds is None and dt_ is None:
+        out['xSt8Tp20'] = r20 * 100
+    elif dt_ is None or (ds is not None and ds <= dt_):
+        out['xSt8Tp20'] = -8.0
+    else:
+        out['xSt8Tp20'] = 20.0
+    pk, x = ec, None
+    for j in range(e + 1, e + 21):
+        c = b.close[j]
+        pk = max(pk, c)
+        if c <= pk * 0.9:
+            x = c / ec - 1
+            break
+    out['xTrail10'] = (x if x is not None else r20) * 100
+    return out
+
+
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
                  delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False, include_chip2=False):
     """FinMind 每小時額度用完時（HTTP 402）不會把剩下的股票全部記成失敗，而是暫停等待、額度恢復後從同一檔繼續；
@@ -2840,6 +2879,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
             row['entryClose'] = ec
             for h in HORIZONS:
                 row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
+            row.update(exit_feats(b, e))   # 2026-11-04 出場規則回測欄位（跟美股同一套）
             recs.append(row)
         if not recs:
             return None, None   # 沒有落在評估區間／流動性門檻內，不算失敗
@@ -3176,15 +3216,127 @@ def market_position(mt, kp):
     return pct, act, sc, '、'.join(parts)
 
 
+# ── 2026-11-03 過熱／反彈訊號燈：用大盤預測評分卡的即時讀數（數值＋歷史百分位），四個面向各一盞燈，不另外打 API ──
+HEAT_RULES = (
+    ('過熱', '價格乖離', lambda g: (g('偏離200日均線%', 'p') or 0) >= 90 or (g('RSI14') or 0) > 75, '偏離200日均線在歷史前10%或 RSI>75'),
+    ('過熱', '散戶槓桿', lambda g: (g('整體融資偏離一年均值%', 'p') or 0) >= 90 or (g('整體融資近20日變化%', 'p') or 0) >= 90, '整體融資偏離一年均值或近20日增幅在歷史前10%'),
+    ('過熱', '外資背離', lambda g: ((g('外資現貨近20日買賣超(億)', 'p') if g('外資現貨近20日買賣超(億)', 'p') is not None else 100) <= 10
+                                 or (g('外資台指期淨未平倉(口)', 'p') if g('外資台指期淨未平倉(口)', 'p') is not None else 100) <= 10)
+                                and (g('偏離200日均線%', 'p') or 0) >= 60, '外資現貨或台指期淨部位在歷史最空的10%，指數卻仍在長期均線上方高檔'),
+    ('過熱', '避險不足', lambda g: (g('法人選擇權P/C未平倉比', 'p') if g('法人選擇權P/C未平倉比', 'p') is not None else 100) <= 10
+                                or (g('60日波動率%', 'p') if g('60日波動率%', 'p') is not None else 100) <= 10, '法人 P/C 未平倉比或60日波動率在歷史最低10%（沒人避險）'),
+    ('反彈', '價格超跌', lambda g: (g('距一年高點%') if g('距一年高點%') is not None else 0) <= -15 or (g('RSI14') if g('RSI14') is not None else 50) < 30, '距一年高點跌≥15% 或 RSI<30'),
+    ('反彈', '槓桿清洗', lambda g: (g('整體融資近20日變化%') if g('整體融資近20日變化%') is not None else 0) <= -8, '整體融資近20日減少≥8%（斷頭殺完）'),
+    ('反彈', '外資回補', lambda g: ((g('外資台指期近20日變化(口)', 'p') or 0) >= 80 and (g('外資台指期淨未平倉(口)', 'p') if g('外資台指期淨未平倉(口)', 'p') is not None else 100) <= 40)
+                                or (g('美元兌台幣近20日變化%', 'p') if g('美元兌台幣近20日變化%', 'p') is not None else 100) <= 15, '外資台指期空單從低檔明顯回補，或台幣近20日升值幅度在歷史前15%'),
+    ('反彈', '恐慌極端', lambda g: (g('法人選擇權P/C未平倉比', 'p') or 0) >= 90 or (g('60日波動率%', 'p') or 0) >= 90, '法人 P/C 未平倉比或60日波動率在歷史最高10%'),
+)
+
+
+def heat_lights(pred):
+    """→ (過熱亮燈數, 反彈亮燈數, [(類別, 面向, 是否亮, 說明)]) ；沒有評分卡讀數回 None"""
+    if not pred or pred.get('err') or not pred.get('det'):
+        return None
+    D = {d['name']: d for d in pred['det']}
+
+    def g(nm, k='v'):
+        d = D.get(nm)
+        if not d:
+            return None
+        return d.get('pct') if k == 'p' else d.get('val')
+    out = []
+    for kind, nm, fn, why in HEAT_RULES:
+        try:
+            on = bool(fn(g))
+        except Exception:  # noqa
+            on = False
+        out.append((kind, nm, on, why))
+    return sum(1 for x in out if x[0] == '過熱' and x[2]), sum(1 for x in out if x[0] == '反彈' and x[2]), out
+
+
+def heat_light_lines(pred):
+    h = heat_lights(pred)
+    if not h:
+        return ['・🚦 過熱／反彈訊號燈：需要先在「🔮 大盤預測」建立評分卡（訊號燈用評分卡的即時讀數，不另外打 API）']
+    nh, nr, L = h
+    lamp = lambda kind, on: ('🔴' if kind == '過熱' else '🟢') if on else '⚪'
+    hot = '　'.join(f'{lamp(k, on)}{nm}' for k, nm, on, _ in L if k == '過熱')
+    reb = '　'.join(f'{lamp(k, on)}{nm}' for k, nm, on, _ in L if k == '反彈')
+    if nh >= 3 and nr <= 1:
+        verdict = '多面向同時過熱：跌下來會跌比較深，宜降低持股、不追高（過熱不代表馬上跌，台股常在過熱後續漲）'
+    elif nr >= 3:
+        verdict = '反彈條件多數成形：恐慌與槓桿已清洗，可分批佈局，等指數站回5日線確認'
+    elif nr >= 2 and nh <= 1:
+        verdict = '反彈條件開始出現：先小量試單，等外資回補或融資清洗完成再加碼'
+    elif nh >= 2:
+        verdict = '部分過熱：維持或略降部位，留意融資與外資動向'
+    else:
+        verdict = '沒有明顯過熱或反彈訊號：依建議持股正常操作'
+    return [f"・🚦 **過熱訊號燈 {nh}/4**：{hot}",
+            f"・🚦 **反彈訊號燈 {nr}/4**：{reb}",
+            f"・訊號燈判讀：{verdict}（亮燈條件：" + '；'.join(f'{nm}＝{why}' for _, nm, on, why in L if on) + '）' if any(on for *_, on, _ in L) else f"・訊號燈判讀：{verdict}"]
+
+
+def heat_adjust(pos, pred):
+    """2026-11-03 溫度計＋K線的建議持股再用訊號燈微調：過熱每亮一盞 −10%、反彈每亮一盞 +10%；
+    過熱≥3 盞且反彈≤1 盞時最高 50%（價格便宜但籌碼還沒洗乾淨）。回傳 (調整後%, 說明)；沒有訊號燈讀數就原樣回傳"""
+    h = heat_lights(pred)
+    if pos is None or not h:
+        return pos, ''
+    nh, nr, _ = h
+    adj = max(0, min(100, pos - 10 * nh + 10 * nr))
+    note = []
+    if nh or nr:
+        note.append(f'訊號燈 過熱{nh}盞 −{10 * nh}%、反彈{nr}盞 +{10 * nr}%')
+    if nh >= 3 and nr <= 1 and adj > 50:
+        adj = 50
+        note.append('過熱≥3盞且反彈≤1盞，上限50%')
+    adj = int(round(adj / 5) * 5)
+    return adj, '、'.join(note)
+
+
+def market_verdict(mt, kp, pred):
+    """2026-11-03 綜合判斷：把價格面（K線＋溫度計）跟籌碼面（訊號燈）的矛盾直接講出來"""
+    h = heat_lights(pred)
+    tz, kz = (mt or {}).get('zone'), (kp or {}).get('zone')
+    cheap = kz == '超賣' or tz in ('極冷', '偏冷')
+    rich = kz == '過熱' or tz in ('偏熱', '過熱')
+    if not h:
+        return None
+    nh, nr, _ = h
+    if cheap and nh >= 3 and nr <= 1:
+        return '🧭 綜合判斷：**價格已超賣、但籌碼還沒洗乾淨**（融資高、外資偏空）→ 常見於下跌中段，先維持約半倉，等「槓桿清洗」或「外資回補」亮燈再加碼'
+    if cheap and nr >= 2:
+        return '🧭 綜合判斷：**價格超賣＋籌碼開始清洗** → 較好的進場區，可分批提高部位'
+    if cheap:
+        return '🧭 綜合判斷：**價格偏低、籌碼中性** → 可逢低分批，留意融資與外資動向'
+    if rich and nh >= 2:
+        return '🧭 綜合判斷：**價格與籌碼同時過熱** → 跌下來會比較深，宜降低持股、不追高'
+    if rich:
+        return '🧭 綜合判斷：**價格偏熱、籌碼尚可** → 照常操作，不追高'
+    if nh >= 3:
+        return '🧭 綜合判斷：**價格中性、籌碼過熱** → 風險偏高，部位略低於中性'
+    if nr >= 3:
+        return '🧭 綜合判斷：**價格中性、恐慌與清洗訊號多** → 可逐步提高部位'
+    return '🧭 綜合判斷：價格與籌碼都沒有極端訊號 → 正常部位'
+
+
 def market_guide_lines(mt, kp, pred=None):
     """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）；
     大盤預測評分卡樣本外驗證有效時，建議持股改用評分卡"""
     out = []
     ps = market_position(mt, kp)
+    _heat = heat_light_lines(pred)
+    _vd = market_verdict(mt, kp, pred)
+    if _vd:
+        out.append(_vd)
     if pred and not pred.get('err') and pred.get('valid') and pred.get('models'):
         out.append(mp_guide_text(pred, ps[0] if ps else None))
         ps = None
     if ps:
+        _adj, _why = heat_adjust(ps[0], pred)
+        if _why and _adj != ps[0]:
+            ps = (_adj, '依訊號燈調整', ps[2], ps[3] + f'；溫度計＋K線原本 {ps[0]}%，{_why}')
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
                    + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
     if kp:
@@ -3238,6 +3390,7 @@ def market_guide_lines(mt, kp, pred=None):
         if kp['zone'] != '超賣' and not cold_t:
             w.append('最佳時機＝K線「超賣」且溫度計同時「偏冷／極冷」')
         out.append('・接下來觀察：' + '；'.join(w))
+    out += _heat
     return out
 
 
@@ -3257,7 +3410,9 @@ def mp_fetch(token, years, log=None):
                                          filt=lambda r: (_fnum(r.get('spot_buy')) or 0) > 0)),
             ('fi', lambda: _daily_series('TaiwanStockTotalInstitutionalInvestors', None, token, days,
                                          [lambda r: (_fnum(r.get('buy')) or 0) - (_fnum(r.get('sell')) or 0)],
-                                         filt=lambda r: 'Foreign' in str(r.get('name') or '') or '外資' in str(r.get('name') or ''))))
+                                         filt=lambda r: 'Foreign' in str(r.get('name') or '') or '外資' in str(r.get('name') or ''))),
+            ('opt', lambda: fetch_opt_inst(token, days)))
+    # 2026-10-30：台指VIX（fetch_tw_vix）FinMind 只有近期資料、歷史不到250天，評分卡用不到 → 不再抓（函式保留）
     for k, fn_ in jobs:
         try:
             H[k] = fn_()
@@ -3266,6 +3421,67 @@ def mp_fetch(token, years, log=None):
         except Exception:  # noqa
             H[k] = None
     return H
+
+
+def _opt_cp(r):
+    v = str(r.get('call_put') or '').lower()
+    return 1 if ('買' in v or v == 'call') else (-1 if ('賣' in v or v == 'put') else 0)
+
+
+def _opt_foreign(r):
+    n = str(r.get('institutional_investors') or '')
+    return '外資' in n or 'Foreign' in n
+
+
+def fetch_opt_inst(token, days_back):
+    """2026-10-30 台指選擇權（TXO）三大法人未平倉，一次抓完：
+    [0] 外資選擇權淨多空（億元）＝(買權多方−空方未平倉金額) − (賣權多方−空方未平倉金額)；正＝偏多
+    [1] 三大法人賣權未平倉口數（多＋空）、[2] 三大法人買權未平倉口數（多＋空）→ 法人 P/C 未平倉比"""
+    oi = lambda r: (_fnum(r.get('long_open_interest_balance_volume')) or 0) + (_fnum(r.get('short_open_interest_balance_volume')) or 0)
+    return _daily_series('TaiwanOptionInstitutionalInvestors', 'TXO', token, days_back, [
+        lambda r: (_opt_cp(r) * ((_fnum(r.get('long_open_interest_balance_amount')) or 0)
+                                 - (_fnum(r.get('short_open_interest_balance_amount')) or 0)) / 1e5) if _opt_foreign(r) else 0.0,
+        lambda r: oi(r) if _opt_cp(r) < 0 else 0.0,
+        lambda r: oi(r) if _opt_cp(r) > 0 else 0.0])
+
+
+TW_VIX_FIELDS = ('VIX', 'vix', 'close', 'Close', 'value', 'price')
+
+
+def fetch_tw_vix(token, days_back):
+    """2026-10-30 台指選擇權波動率指數（TaiwanOptionVix，backer／sponsor 會員才有）。
+    欄位名稱不確定 → 依序找 TW_VIX_FIELDS，找不到就用第一個數值欄；同一天多筆（盤中）取最後一筆＝收盤值"""
+    # 2026-10-30：一次抓多年只拿到近期資料 → 改成一年一段由近往遠抓；某段沒資料（已到資料起點）就停
+    end, first = dt.date.today(), dt.date.today() - dt.timedelta(days=days_back)
+    rows, hi = [], end
+    while hi > first:
+        lo = max(first, hi - dt.timedelta(days=365))
+        try:
+            part = api_get(dict(dataset='TaiwanOptionVix', start_date=_ds(lo), end_date=_ds(hi)), token).get('data') or []
+        except FinMindQuotaError:
+            raise
+        except Exception:  # noqa
+            if not rows:
+                raise
+            break
+        if not part and rows:
+            break
+        rows += part
+        hi = lo - dt.timedelta(days=1)
+    if not rows:
+        return None
+    r0 = rows[0]
+    fld = next((f for f in TW_VIX_FIELDS if _fnum(r0.get(f)) is not None), None) or next(
+        (k for k, v in r0.items() if k not in ('date', 'time', 'minute') and _fnum(v) is not None), None)
+    if fld is None:
+        return None
+    last = {}
+    for r in sorted(rows, key=lambda r: (str(r.get('date', '')), str(r.get('time', '') or r.get('minute', '')))):
+        v = _fnum(r.get(fld))
+        if v is not None and v > 0:
+            last[str(r.get('date', ''))[:10]] = v
+    ds_ = sorted(d for d in last if len(d) == 10)
+    return (ds_, [np.array([last[d] for d in ds_], dtype=float)]) if ds_ else None
 
 
 def mp_features(H):
@@ -3285,6 +3501,12 @@ def mp_features(H):
     if ok('fi'):
         v = pd.Series(H['fi'][1][0], index=H['fi'][0]).rolling(20, min_periods=15).sum() / 1e8
         F['外資現貨近20日買賣超(億)'] = mp_align(F.index, list(v.index), v.values, lag=1)
+    if ok('opt'):   # 2026-10-30 選擇權：外資淨多空、法人 P/C 未平倉比（收盤後公布 → 用前一交易日）
+        d_, (fn_, put_, call_) = H['opt']
+        F['外資選擇權淨多空(億)'] = mp_align(F.index, d_, fn_, lag=1)
+        F['法人選擇權P/C未平倉比'] = mp_align(F.index, d_, np.where(call_ > 0, put_ / np.where(call_ > 0, call_, 1), np.nan), lag=1)
+    if ok('vix'):   # 台指VIX 收盤值當天就有，跟指數收盤同時 → 不用延遲
+        F['台指VIX'] = mp_align(F.index, H['vix'][0], H['vix'][1][0])
     return F, c
 
 
@@ -3395,7 +3617,7 @@ def _mp_score(X, w, rows):
 MP_MODELS = (('ret', '報酬模型', '未來20日報酬'), ('risk', '風險模型', '未來20日最大跌幅'))
 # 風險模型不從資料學權重（各期間 IC 方向會翻來翻去，學出來的權重樣本外常常反向），
 # 改用市場常識固定方向、等權：+1＝數值越高之後跌幅越小，−1＝數值越高風險越大；walk-forward 只用來驗證，不調參數
-MP_RISK_PRIOR = {'距一年高點%': 1, '偏離200日均線%': 1, '60日波動率%': -1, '外資台指期淨未平倉(口)': 1, '外資台指期近20日變化(口)': 1, '美元兌台幣近20日變化%': -1, '外資現貨近20日買賣超(億)': 1}
+MP_RISK_PRIOR = {'距一年高點%': 1, '偏離200日均線%': 1, '60日波動率%': -1, '台指VIX': -1, '外資選擇權淨多空(億)': 1, '法人選擇權P/C未平倉比': 1, '外資台指期淨未平倉(口)': 1, '外資台指期近20日變化(口)': 1, '美元兌台幣近20日變化%': -1, '外資現貨近20日買賣超(億)': 1}
 
 
 def _mp_model(X, y, r, dd, n, idx, kind, fixed=None):
@@ -3642,8 +3864,12 @@ def render_market_pred(st, ss, K):
                 with st.spinner('抓取大盤歷史資料並做樣本外驗證中…'):
                     rep = mp_build(tok, yrs)
                 ss['mp_rep'] = rep
-                if rep.get('models'):
+                _old = mp_load()
+                if rep.get('models') and (rep.get('valid') or not (_old and _old.get('valid'))):
                     mp_save(rep)
+                elif rep.get('models'):   # 2026-11-03：新評分卡沒通過驗證 → 不覆蓋上一張通過的，批次分析的建議持股才不會大跳
+                    st.warning(f"⚠️ 這次重建的評分卡沒有通過驗證，**批次分析繼續使用上一張通過的評分卡**（{_old.get('built', '')} 建立）。"
+                               '下方顯示的是這次重建的結果，僅供比較；要改用這張，請下載後用下方「載入」上傳。')
             except Exception as ex:  # noqa
                 st.error(f'❌ 大盤預測回測失敗：{ex}')
     up_ = st.file_uploader('或載入先前下載的評分卡（.json；Streamlit Cloud 重新啟動後本機檔案會消失，可用這個還原）', type=['json'], key='mp_up')
@@ -3709,6 +3935,75 @@ def render_market_pred(st, ss, K):
             st.markdown(mp_guide_text(now, None).replace('（原本溫度計＋K線規則為 --%）', ''))
         st.dataframe(pd.DataFrame([dict(指標=d['name'], 目前數值=d['val'], 歷史百分位=d['pct']) for d in now['det']]),
                      hide_index=True, use_container_width=True)
+
+
+TOP_MARK_N = 5   # 2026-11-01：批次分析中「最高勝率」「最高飆股率」各標示前幾名
+
+
+def _stat20(d):
+    d = d or {}
+    v = d.get('20')
+    if v is None:
+        vals = [x for x in d.values() if x is not None]
+        v = max(vals) if vals else None
+    return v
+
+
+def _best_stat(groups, key, K, live):
+    """groups：[(代號字首, 組合清單, 命中索引), ...] → (最高值, 來源編號)"""
+    best, by = None, ''
+    for code, lst, idxs in groups:
+        for i in idxs:
+            v = _stat20(combo_stats(lst[i], code, K, live).get(key))
+            if v is not None and (best is None or v > best):
+                best, by = float(v), f'{code}{i + 1}'
+    return best, by
+
+
+def mark_top(df, n=None):
+    """在 df 加「🏅標示」：最高勝率前 n 名標 🏆、最高飆股率前 n 名標 🚀（同值同名次）"""
+    n = n or TOP_MARK_N
+    tag = [''] * len(df)
+    for col, icon in (('最高勝率%', '🏆勝率'), ('最高飆股率%', '🚀飆股')):
+        if col not in df.columns:
+            continue
+        v = pd.to_numeric(df[col], errors='coerce')
+        if v.notna().sum() == 0:
+            continue
+        cut = v.dropna().sort_values(ascending=False).iloc[min(n, v.notna().sum()) - 1]
+        rk = v.rank(ascending=False, method='min')
+        for j, (x, r_) in enumerate(zip(v, rk)):
+            if pd.notna(x) and x >= cut:
+                tag[j] = (tag[j] + ' ' if tag[j] else '') + f'{icon}#{int(r_)}'
+    df['🏅標示'] = tag
+    return df
+
+
+def top_mark_lines(df, n=None):
+    """批次摘要上方的「🏆 最高勝率／🚀 最高飆股率」前 n 名清單（Markdown）"""
+    n = n or TOP_MARK_N
+    out = []
+    for col, by, icon, nm in (('最高勝率%', '_winBy', '🏆', '最高勝率（S／W 組合 20 日勝率）'), ('最高飆股率%', '_moonBy', '🚀', '最高飆股機率（F 組合 20 日漲>30% 比例）')):
+        if col not in df.columns:
+            continue
+        d = df[pd.to_numeric(df[col], errors='coerce').notna()].sort_values(col, ascending=False).head(n)
+        if len(d):
+            out.append(f'**{icon} {nm}前{len(d)}名**：' + '　'.join(
+                f"{r['股票']} {r['名稱']}（{r[col]:.1f}%，{r.get(by, '')}）" for _, r in d.iterrows()))
+    return out
+
+
+PICK_N = 20   # 2026-11-04 本月建議組合檔數
+
+
+def monthly_picks(df, n=None):
+    """2026-11-04 比照美股：主力＝命中 S 或 W、排除⚠️（外資持股減少／融資大減／S命中但低本益比），依多方力道取前 n 檔；
+    籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%（三年回測疊加在強勢條件上全部加分）。台股投資組合模擬待上櫃回測後驗證"""
+    n = n or PICK_N
+    if df is None or not len(df) or '_sw' not in df.columns:
+        return None, None
+    main = df[df['_sw'] & ~df['_warn']].sort_values('多方力道', ascending=False)
+    return main.head(n), main[main['_chipUp']].head(n)
 
 
 def summary_frame(results, extras_flags, K, live=None):
@@ -3813,6 +4108,15 @@ def summary_frame(results, extras_flags, K, live=None):
             return ' '.join(txt) + (f' +{more}' if more > 0 else '')
         rec['回測高勝率命中'] = _short(mw, 'W', K.get('BT_WIN_COMBOS', []), 'W', 'win')
         rec['回測飆股命中'] = _short(mf, 'F', K.get('BT_HOT_COMBOS', []), 'F', 'moon')
+        # 2026-11-01 最高勝率／最高飆股率：只用三年回測驗證過的清單（勝率＝S、W；飆股率＝F），取 20 日（沒有就取各天期最高）
+        # 2026-11-04 本月建議組合用：S 或 W 命中；⚠️＝外資持股近20日減少≥1%、融資近20日減少≥20%（三年回測疊加在強勢條件上多數扣分）、S命中但P/E<12倍
+        _rw = r['row']
+        rec['_sw'] = bool(ms or mw)
+        rec['_warn'] = bool((isnum(_rw.get('fhChg20')) and _rw['fhChg20'] <= -1) or (isnum(_rw.get('mgChg20')) and _rw['mgChg20'] <= -20)
+                            or (ms and not mw and isnum(_rw.get('pe')) and 0 < _rw['pe'] < 12))
+        rec['_chipUp'] = bool((isnum(_rw.get('fhChg20')) and _rw['fhChg20'] >= 1) or (isnum(_rw.get('mgChg20')) and _rw['mgChg20'] >= 20))
+        rec['最高勝率%'], rec['_winBy'] = _best_stat([('S', K['STOCK_PICK_COMBOS'], ms), ('W', K.get('BT_WIN_COMBOS', []), mw)], 'win', K, live)
+        rec['最高飆股率%'], rec['_moonBy'] = _best_stat([('F', K.get('BT_HOT_COMBOS', []), mf)], 'moon', K, live)
         rec['命中數'] = len(ms) + len(mp) + len(mm)
         # 命中類別數：S/#/M/W/F 五類中命中幾類（同類多個組合常共用同一訊號，類別數比總命中數更能反映訊號強弱）
         rec['命中類別數'] = sum(1 for x in (ms, mp, mm, mw, mf) if x)
@@ -3829,7 +4133,8 @@ def summary_frame(results, extras_flags, K, live=None):
         return df
     # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
     df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
-    front = ['類股', '股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
+    mark_top(df)
+    front = ['類股', '股票', '名稱', '🏅標示', '股價', '漲跌幅%', '最高勝率%', '最高飆股率%', '命中類別數', '組合型態', '大盤適用', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
 
@@ -4588,7 +4893,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-10-30 價格因子'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-04 出場規則紀錄＋本月建議組合'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -4894,6 +5199,26 @@ def render_batch(st, ss, K):
         st.dataframe(tw_, hide_index=True, use_container_width=True, height=240)
         st.dataframe(tf_, hide_index=True, use_container_width=True, height=240)
 
+    _pm, _pc = monthly_picks(df)
+    if _pm is not None:
+        with st.expander(f'📦 本月建議組合（主力 {len(_pm)} 檔／籌碼加持 {len(_pc)} 檔；每20個交易日換股一次、等權重）', expanded=False):
+            st.caption('比照美股三年投資組合模擬的做法（美股：主力年化約23%、等權大盤約17%）：主力＝命中 S 或 W、排除⚠️外資持股近20日減少≥1%／融資近20日減少≥20%／S命中但P/E<12倍，'
+                       '依多方力道取前20檔；籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%（台股三年回測疊加在強勢條件上全部加分；需勾「🧮 進階籌碼」）。'
+                       '**出場：抱滿20個交易日再換股，不設固定停損**（美股三年回測：停損−8% 年化約砍半）。⚠️ 台股的投資組合模擬與出場規則待上櫃六段回測後驗證，僅供參考。')
+            _cols = [c for c in ('類股', '股票', '名稱', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '籌碼訊號') if c in df.columns]
+            _a, _b = st.columns(2)
+            _a.markdown('**🚀 主力組合**（S 或 W，排除⚠️）')
+            _a.dataframe(_pm[_cols], hide_index=True, use_container_width=True)
+            _b.markdown('**💰 籌碼加持**（主力＋外資持股或融資增加）' + ('' if len(_pc) else '　— 沒有符合的股票，或沒勾「🧮 進階籌碼」'))
+            if len(_pc):
+                _b.dataframe(_pc[_cols], hide_index=True, use_container_width=True)
+            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（覆蓋）', key='pick_to_list4', disabled=not len(_pm)):
+                ss['lists']['我的清單4'] = [str(x) for x in _pm['股票']]
+                save_custom_lists(ss['lists'])
+                st.success(f'✅ 已存成「我的清單4」（{len(_pm)} 檔）')
+    _tl = top_mark_lines(df)
+    if _tl:
+        st.info('\n\n'.join(_tl) + '\n\n（摘要表「🏅標示」欄同步標出；勝率／飆股率取命中組合中最高的一個，只用三年回測驗證過的 S／W／F 清單）')
     c1, c2, c3, c5, c4 = st.columns([1.2, 1.4, 1.4, 1.1, 1])
     f_rg = c5.radio('大盤適用', ['全部', '有✅', '不含❌'], horizontal=True,
                     help='依今日大盤狀態，看命中的組合在這種大盤下的回測：有✅＝至少一個組合有效；不含❌＝排除命中「這種大盤下回測為負」組合的股票')
@@ -4917,7 +5242,7 @@ def render_batch(st, ss, K):
         m &= df['_regOk'] > 0
     elif f_rg == '不含❌' and '_regBad' in df.columns:
         m &= df['_regBad'] == 0
-    view = df[m].drop(columns=['_pbPass', '_pt', '_regOk', '_regBad'], errors='ignore')
+    view = df[m].drop(columns=['_pbPass', '_pt', '_regOk', '_regBad', '_winBy', '_moonBy', '_sw', '_warn', '_chipUp'], errors='ignore')
     st.caption(f'顯示 {len(view)} / {len(df)} 檔（點欄位標題可排序）')
     colcfg = {c: st.column_config.NumberColumn(format='%.1f') for c in
               ['+DI', '-DI', 'ADX', 'ADXR', '布林位置%', '布林寬度%', 'RS(vs0050)%', 'P/E', '營收YoY%(最新)',
