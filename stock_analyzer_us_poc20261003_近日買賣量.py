@@ -4826,7 +4826,7 @@ PICK_N = 20   # 2026-11-03 本月建議組合檔數
 
 def monthly_picks(df, n=None):
     """2026-11-03 投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）最穩的規則：
-    主力＝命中 S 或 W、排除⚠️（毛利率年減／近20日平淡），依多方力道取前 n 檔；保守＝營運雙優（毛利率年增＋EPS大幅優於預期）依多方力道取前 n 檔"""
+    主力＝命中 S 或 W、排除⚠️（毛利率年減／近20日平淡／2026-11-06 加：中期弱勢 12-1月輸大盤≥20%），依多方力道取前 n 檔；保守＝營運雙優（毛利率年增＋EPS大幅優於預期）依多方力道取前 n 檔"""
     n = n or PICK_N
     if df is None or not len(df) or '_sw' not in df.columns:
         return None, None
@@ -4975,7 +4975,9 @@ def summary_frame(results, extras_flags, K, live=None):
         _gy = _rw.get('gmYoY') if isnum(_rw.get('gmYoY')) else None
         _es = _rw.get('epsSurprise') if (isnum(_rw.get('epsSurprise')) and isnum(_rw.get('earnDays')) and _rw['earnDays'] <= 63) else None
         rec['_sw'] = bool(ms or mw)
-        rec['_warn'] = bool((_gy is not None and _gy <= -2) or (isnum(_rw.get('max1d20')) and _rw['max1d20'] < 3))
+        # 2026-11-06：再排除「中期弱勢（12-1月輸大盤≥20%）」— V／Y／Q 三樣本疊在 S／W 上超額≈0，排除後組合年化 18.7→24.7%、23.9→26.4%、29.6→31.2%，回撤也都變小
+        rec['_warn'] = bool((_gy is not None and _gy <= -2) or (isnum(_rw.get('max1d20')) and _rw['max1d20'] < 3)
+                            or (isnum(_rw.get('rs12_1')) and _rw['rs12_1'] <= -20))
         rec['_dual'] = bool(_gy is not None and _gy >= 2 and _es is not None and _es >= 10)
         rec['最高勝率%'], rec['_winBy'] = _best_stat([('S', K['STOCK_PICK_COMBOS'], ms), ('W', K.get('BT_WIN_COMBOS', []), mw)], 'win', K, live)
         rec['最高飆股率%'], rec['_moonBy'] = _best_stat([('F', K.get('BT_HOT_COMBOS', []), mf)], 'moon', K, live)
@@ -5795,7 +5797,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-06 加測減碼30／50%'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-06 美股排除中期弱勢'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6181,14 +6183,14 @@ def render_batch(st, ss, K):
     _pm, _ps = monthly_picks(df)
     if _pm is not None:
         with st.expander(f'📦 本月建議組合（主力 {len(_pm)} 檔／保守 {len(_ps)} 檔；每20個交易日換股一次、等權重）', expanded=False):
-            st.caption('依美股三年投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）：主力＝命中 S 或 W、排除⚠️毛利率年減／近20日平淡，依多方力道取前20檔'
-                       '（年化約 22～36%、最大回撤約 −25～−28%，報酬勝過等權大盤但波動較大）；保守＝營運雙優（毛利率年增≥2pp＋EPS大幅優於預期≥10%），'
+            st.caption('依美股三年投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）：主力＝命中 S 或 W、排除⚠️毛利率年減／近20日平淡／中期弱勢（12-1月輸大盤≥20%），依多方力道取前20檔'
+                       '（2026-11-06 三樣本重算：年化約 25～31%（S&P 500 同期約19%）、最大回撤約 −19～−28%；加排除中期弱勢後三個樣本年化都提高 1.6～6 個百分點、回撤也變小）；保守＝營運雙優（毛利率年增≥2pp＋EPS大幅優於預期≥10%），'
                        '新股票驗證夏普最高、回撤接近大盤（需勾「💎 財報品質」）。'
                        '**出場：抱滿20個交易日再換股，不設固定停損**（2026-11-04 三年回測：停損−8% 年化約砍半、夏普全部變差；空頭時訊號常先洗再漲）；'
                        '要控制風險請用大盤指引的建議持股調整總資金。S9／彩券型怕大回撤可改用「移動停利10%」（自進場後最高收盤回落10%出場，S9 回撤 −32%→−20%，年化少約11個百分點）。只有三年樣本，僅供參考。')
             _cols = [c for c in ('股票', '名稱', '類股', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '財報訊號') if c in df.columns]
             _a, _b = st.columns(2)
-            _a.markdown('**🚀 主力組合**（S 或 W，排除⚠️）')
+            _a.markdown('**🚀 主力組合**（S 或 W，排除⚠️毛利率年減／平淡／中期弱勢）')
             _a.dataframe(_pm[_cols], hide_index=True, use_container_width=True)
             _b.markdown('**🛡️ 保守組合**（營運雙優）' + ('' if len(_ps) else '　— 沒有符合的股票，或沒勾「💎 財報品質＋P/E位階」'))
             if len(_ps):
