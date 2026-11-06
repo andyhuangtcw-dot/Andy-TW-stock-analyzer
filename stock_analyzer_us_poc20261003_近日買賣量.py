@@ -3018,7 +3018,9 @@ def load_bt_files(files):
 BT_SEG_MONTHS = 6   # 三年分六段：每段半年（全美股一年一段容易超過 Streamlit Cloud 記憶體）
 BT_SEG_OPTIONS = (['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
                   # 2026-11-06 加測 2022 空頭：第7～10段＝3～5年前（約 2021-11～2023-11；S&P 500 2022 年約 −19%、那斯達克約 −33%）
-                  + [f'加測2022空頭・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6, 10)])
+                  + [f'加測2022空頭・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6, 10)]
+                  # 2026-11-06 加測 2020 疫情崩盤＋V 型反彈：第11～14段＝5～7年前（約 2019-11～2021-11）
+                  + [f'加測2020崩盤・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(10, 14)])
 
 WINSOR_OPTIONS = {'截尾 1%／99%（建議）': 0.01, '截尾 0.5%／99.5%': 0.005, '不處理': 0.0}
 ANALYSIS_DEFAULTS = dict(min_px=10.0, wq=0.01)
@@ -5445,11 +5447,13 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
 def attach_mkt(results, token, bm, vx_live):
     """大盤資料（K線位置、評分卡即時讀數、VIX）掛到每檔結果上；全市場分批時只在最後做一次"""
     _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
+    _bmd = list(bm.date) if _bmc else None
     _sc = mp_load()
     _mpr = mp_live(token, _sc) if _sc and _sc.get('w') else None
     for r in results:
         r['mkt_pred'] = _mpr
         r['bm_close'] = _bmc
+        r['bm_date'] = _bmd   # 2026-11-06 📍 組合報酬監控算同期 SPY 報酬用
         r['vix'] = vx_live   # 大盤K線位置用（同一份清單，不重複佔記憶體）
 
 
@@ -5869,6 +5873,83 @@ def load_custom_lists(K):
         d.setdefault(k, [])
     return d
 
+PICK_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pick_meta_us.json')
+
+
+def load_pick_meta():
+    try:
+        with open(PICK_META_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:  # noqa
+        return None
+
+
+def save_pick_meta(m):
+    try:
+        with open(PICK_META_FILE, 'w', encoding='utf-8') as f:
+            json.dump(m, f, ensure_ascii=False)
+        return True
+    except Exception:  # noqa
+        return False
+
+
+def pick_tracker(results, meta):
+    """2026-11-06 本月建議組合報酬監控：存成「我的清單4」那天收盤當進場價，等權重算累計報酬、同期大盤（SPY）報酬、超額、個股漲跌。
+    美股三年回測（V／Y 樣本）：本月建議每期（20日）平均約 +1.8%（等權大盤約 +1.4%）、每期勝率約 64%、贏大盤的期數約 53～56%"""
+    if not meta or not meta.get('date') or not meta.get('ids'):
+        return None
+    d0 = meta['date']
+    B = {r['stockId']: r for r in results if r.get('bars') is not None}
+    ser, each = [], []
+    for sid in meta['ids']:
+        r = B.get(sid)
+        if r is None:
+            continue
+        b = r['bars']
+        i0 = bisect.bisect_right(b.date, d0) - 1   # 存檔當天（含）以前最後一根＝進場價
+        if i0 < 0 or not b.close[i0]:
+            continue
+        ser.append(pd.Series([c / b.close[i0] for c in b.close[i0:]], index=b.date[i0:]))
+        each.append((sid, r.get('name', sid), (b.close[-1] / b.close[i0] - 1) * 100))
+    if not ser:
+        return None
+    nav = pd.concat(ser, axis=1).sort_index().ffill().mean(axis=1)
+    out = dict(date=d0, n=len(ser), total=len(meta['ids']), days=len(nav) - 1, ret=(nav.iloc[-1] - 1) * 100,
+               up=sum(1 for x in each if x[2] > 0), each=sorted(each, key=lambda x: -x[2]), mkt=None)
+    r0 = next((r for r in results if r.get('bm_close') and r.get('bm_date')), None)
+    if r0:
+        bd, bc = r0['bm_date'], r0['bm_close']
+        k0 = bisect.bisect_right(bd, d0) - 1
+        if 0 <= k0 < len(bc) and bc[k0]:
+            out['mkt'] = (bc[-1] / bc[k0] - 1) * 100
+    return out
+
+
+PICK_REF = (1.8, 1.9)   # 本月建議組合歷史每期（20日）平均報酬（美股 V／Y 樣本，扣成本）
+
+
+def pick_tracker_text(t):
+    if not t:
+        return None
+    col = lambda v: f":{'green' if v >= 0 else 'red'}[**{v:+.1f}%**]"   # 美股慣例：綠漲紅跌
+    lo, hi = PICK_REF
+    exp = f"{lo * t['days'] / 20:+.1f}～{hi * t['days'] / 20:+.1f}%" if 0 < t['days'] < 20 else f"{lo:+.1f}～{hi:+.1f}%"
+    ex = t['ret'] - t['mkt'] if t.get('mkt') is not None else None
+    if ex is None:
+        judge = ''
+    elif ex >= 0:
+        judge = '　✅ 跑贏大盤'
+    else:
+        judge = '　⚠️ 落後大盤（單期落後很常見：歷史上約 45% 的期數輸大盤，不必提前出場，滿20日照常換股）'
+    top = '、'.join(f"{sid} {v:+.1f}%" for sid, _, v in t['each'][:3])
+    bot = '、'.join(f"{sid} {v:+.1f}%" for sid, _, v in t['each'][-3:][::-1])
+    return (f"📍 組合報酬監控（{t['date']} 存成我的清單4，{t['n']}/{t['total']} 檔有資料）：持有第 {t['days']} 個交易日"
+            + ('（已滿20日，該換股了）' if t['days'] >= 20 else f"（第20日換股，還有 {20 - t['days']} 日）")
+            + f"\n\n・組合累計 {col(t['ret'])}"
+            + (f"｜同期大盤(SPY) {col(t['mkt'])}｜超額 {col(ex)}" if ex is not None else '')
+            + f"｜上漲 {t['up']}/{t['n']} 檔｜歷史同期平均約 {exp}{judge}"
+            + (f"\n\n・領先：{top}｜落後：{bot}" if t['n'] > 5 else '\n\n・個股：' + '、'.join(f"{sid} {v:+.1f}%" for sid, _, v in t['each'])))
+
 
 def save_custom_lists(d):
     try:
@@ -5884,7 +5965,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-06 全市場分批自動跑'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-06 美股報酬監控＋2020段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6032,7 +6113,7 @@ def main():
                                     '依成交金額排名交錯分成 A（第1、3、5…名）／B（第2、4、6…名）各約1000檔，記憶體減半；A、B 都能代表全市場，各自跑完六段後可一起載入合併分析')
         bt_workers = st.number_input('回測平行抓取數', 1, 32, 8, 1, key='bt_workers', help='同時抓幾檔；總請求數仍受每分鐘上限控制')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
-                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析。第7～10段（3～5年前）是加測 2022 空頭用')
+                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析。第7～10段（3～5年前）是加測 2022 空頭用；第11～14段（5～7年前）是加測 2020 疫情崩盤用')
         if bt_seg == BT_SEG_OPTIONS[0]:
             bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
             bt_off = 0
@@ -6041,7 +6122,9 @@ def main():
             st.caption(f'本次評估區間：{bt_off}～{bt_off + BT_SEG_MONTHS} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
                        '六段都下載後，六個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋仍依評估日切成三段（每年一段）驗證。'
                        + ('　⚠️ 第7～10段（約 2021-11～2023-11，含 2022 空頭）是空頭驗證用：股票池是「現在」的美股清單，期間下市的股票不在裡面（存活者偏差，結果偏樂觀）；之後才上市的股票會自動略過。'
-                          if bt_off >= 36 else '')
+                          if 36 <= bt_off < 60 else '')
+                       + ('　⚠️ 第11～14段（約 2019-11～2021-11，含 2020 疫情崩盤與 V 型反彈）是崩盤驗證用：存活者偏差更大（期間下市的股票不在裡面）。'
+                          if bt_off >= 60 else '')
                        + '　每筆紀錄會附上當天的大盤回撤訊號（需要先建立🔮大盤評分卡；多抓約5次API），用來模擬「減碼＋選股」。')
         bt_div = st.checkbox('📈 近1季YoY乖離度（股價歷史要抓超過1年，明顯拉長時間）', key='bt_div')
         bt_sector = st.checkbox('🏭 類股狀態濾網（每檔多一次 sector 查詢）', key='bt_sector')
@@ -6261,6 +6344,9 @@ def render_batch(st, ss, K):
     B = ss.get('batch')
     if not B or not B['results']:
         st.info('在左側輸入 FMP API Key 與美股代號，點擊「🔍 批次分析」即可開始。')
+        st.markdown('#### 📘 每月操作流程（2026-11-06 回測定案的做法）')
+        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選全美股（約2000檔）、S&P 500 或 Nasdaq-100 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除毛利率年減／近20日平淡／中期弱勢（12-1月輸大盤≥20%），依多方力道取前20檔。\n3. **⚖️ 決定總持股**　看批次分析上方「📋 大盤指引」的建議持股％：3個回撤訊號（風險模型第1級、SPY跌破60日線、VIX急升）全亮 → 持股減半。**⚠️ 減碼照規則就好，不要自己提早或加碼減碼**（2022空頭逐日驗證：3個訊號多半亮在階段低點附近，之後20日大盤平均反而 +1.1%，減碼讓選股組合少賺、回撤也沒變小；這條規則是依16年大盤回測選的，2008／2020 這種一路崩的行情才有用）。20檔等權重分配這筆資金。\n4. **⏳ 持有與換股**　抱滿20個交易日再換股，不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
+        st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
     if B.get('full'):
@@ -6340,10 +6426,15 @@ def render_batch(st, ss, K):
             _b.markdown('**🛡️ 保守組合**（營運雙優）' + ('' if len(_ps) else '　— 沒有符合的股票，或沒勾「💎 財報品質＋P/E位階」'))
             if len(_ps):
                 _b.dataframe(_ps[_cols], hide_index=True, use_container_width=True)
-            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（覆蓋）', key='pick_to_list4', disabled=not len(_pm)):
+            _pt = pick_tracker_text(pick_tracker(results, load_pick_meta()))
+            if _pt:
+                st.markdown(_pt)
+            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（覆蓋，並從今天開始監控組合報酬）', key='pick_to_list4', disabled=not len(_pm)):
                 ss['lists']['我的清單4'] = [str(x) for x in _pm['股票']]
                 save_custom_lists(ss['lists'])
-                st.success(f'✅ 已存成「我的清單4」（{len(_pm)} 檔）')
+                _d0 = max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=str(dt.date.today()))
+                save_pick_meta(dict(date=_d0, ids=[str(x) for x in _pm['股票']]))
+                st.success(f'✅ 已存成「我的清單4」（{len(_pm)} 檔），以 {_d0} 收盤為進場價開始監控報酬')
             # 2026-11-06 分批累加：每批把「全部候選股」累加到清單4，最後跑一次清單4 選出全市場前20檔
             _allc = df[df['_sw'] & ~df['_warn']]
             _cur = ss['lists'].get('我的清單4', [])
