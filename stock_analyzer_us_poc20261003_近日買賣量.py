@@ -1212,7 +1212,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
         row.update(mid_momentum(b, e, bm))
         row.update(risk_feats(b, e, bm))
     row['secMom'] = sector_mom(sb, bm, b.date[e])
-    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS + FQ_KEYS:
+    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS + FQ_KEYS + MKT_DD_KEYS:
         if k in ex:
             row[k] = ex[k]
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -2356,6 +2356,38 @@ def fetch_vix(token, days):
         return None
 
 
+MKT_DD_KEYS = ('vix20chg', 'ddK', 'riskQ', 'ddVix', 'ddB60')   # 2026-11-06 回測紀錄加大盤欄位：用來模擬「回撤訊號減碼＋選股」
+
+
+def vix_chg20(vx, ds):
+    """VIX 近20個交易日變化（點）"""
+    if not vx:
+        return None
+    i = bisect.bisect_right(vx[0], ds) - 1
+    return (vx[1][i] - vx[1][i - 20]) if i >= 20 else None
+
+
+def mkt_dd_map(token, sc, years):
+    """用目前的大盤評分卡，算回測期間每天的回撤訊號（亮幾個、風險模型級別、VIX急升、SPY跌破60日線）
+    → {日期: dict(ddK, riskQ, ddVix, ddB60)}；沒有評分卡或抓不到就回傳 {}（百分位用評分卡完整歷史分布）"""
+    if not sc or not sc.get('models'):
+        return {}
+    F, c = mp_features(mp_fetch(token, years))
+    cv = np.asarray(c.values, dtype=float)
+    out = {}
+    for i in range(min(260, len(F) - 1), len(F)):
+        try:
+            pr = mp_reading(sc, {nm: (F[nm].iloc[i] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[i])[:10],
+                            below60=_below60(cv[:i + 1]), below60h=_b60hs(cv[:i + 1]))
+            d = (pr or {}).get('dd') or {}
+            rk = ((pr or {}).get('models') or {}).get('risk') or {}
+            out[str(F.index[i])[:10]] = dict(ddK=d.get('k'), riskQ=rk.get('q'), ddVix=int('VIX急升' in (d.get('on') or [])),
+                                             ddB60=int('跌破60日線' in (d.get('on') or [])))
+        except Exception:  # noqa
+            continue
+    return out
+
+
 def vix_asof(vx, ds):
     if not vx:
         return None
@@ -2983,7 +3015,9 @@ def load_bt_files(files):
 
 
 BT_SEG_MONTHS = 6   # 三年分六段：每段半年（全美股一年一段容易超過 Streamlit Cloud 記憶體）
-BT_SEG_OPTIONS = ['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
+BT_SEG_OPTIONS = (['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
+                  # 2026-11-06 加測 2022 空頭：第7～10段＝3～5年前（約 2021-11～2023-11；S&P 500 2022 年約 −19%、那斯達克約 −33%）
+                  + [f'加測2022空頭・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6, 10)])
 
 WINSOR_OPTIONS = {'截尾 1%／99%（建議）': 0.01, '截尾 0.5%／99.5%': 0.005, '不處理': 0.0}
 ANALYSIS_DEFAULTS = dict(min_px=10.0, wq=0.01)
@@ -3071,6 +3105,10 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     names = names or {}
     total = len(universe)
     vx = locals().get('vx')
+    try:   # 2026-11-06 回撤訊號（需要先建立大盤評分卡；每次回測多抓約5次API）
+        ddm = mkt_dd_map(token, mp_load(), (months_back + off) / 12 + 2.2)
+    except Exception:  # noqa
+        ddm = {}
     ev_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('shares', 'grades', 'insider')}
     fq_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 財報品質／P/E：前20檔全部失敗（方案不支援季報）就停止抓
     pt_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 前20檔目標價全部失敗（方案不支援）→ 之後不再抓，省API
@@ -3179,6 +3217,9 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                     ex.update(insider_feats(ds, evh['insider']))
                 if vx:
                     ex['vix'] = vix_asof(vx, ds)
+                    ex['vix20chg'] = vix_chg20(vx, ds)
+                if ddm:
+                    ex.update(ddm.get(ds) or {})
                 if fqf:
                     ex.update(fqf(e))
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
@@ -5797,7 +5838,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-06 美股排除中期弱勢'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-06 美股加測2022空頭段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -5939,14 +5980,17 @@ def main():
                                     '依成交金額排名交錯分成 A（第1、3、5…名）／B（第2、4、6…名）各約1000檔，記憶體減半；A、B 都能代表全市場，各自跑完六段後可一起載入合併分析')
         bt_workers = st.number_input('回測平行抓取數', 1, 32, 8, 1, key='bt_workers', help='同時抓幾檔；總請求數仍受每分鐘上限控制')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
-                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析')
+                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析。第7～10段（3～5年前）是加測 2022 空頭用')
         if bt_seg == BT_SEG_OPTIONS[0]:
             bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
             bt_off = 0
         else:
             bt_months, bt_off = BT_SEG_MONTHS, (BT_SEG_OPTIONS.index(bt_seg) - 1) * BT_SEG_MONTHS
             st.caption(f'本次評估區間：{bt_off}～{bt_off + BT_SEG_MONTHS} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
-                       '六段都下載後，六個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋仍依評估日切成三段（每年一段）驗證。')
+                       '六段都下載後，六個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋仍依評估日切成三段（每年一段）驗證。'
+                       + ('　⚠️ 第7～10段（約 2021-11～2023-11，含 2022 空頭）是空頭驗證用：股票池是「現在」的美股清單，期間下市的股票不在裡面（存活者偏差，結果偏樂觀）；之後才上市的股票會自動略過。'
+                          if bt_off >= 36 else '')
+                       + '　每筆紀錄會附上當天的大盤回撤訊號（需要先建立🔮大盤評分卡；多抓約5次API），用來模擬「減碼＋選股」。')
         bt_div = st.checkbox('📈 近1季YoY乖離度（股價歷史要抓超過1年，明顯拉長時間）', key='bt_div')
         bt_sector = st.checkbox('🏭 類股狀態濾網（每檔多一次 sector 查詢）', key='bt_sector')
         bt_earn = st.checkbox('📊 財報驚喜／財報跳空（每檔多一次 earnings 查詢）', True, key='bt_earn',
@@ -6066,7 +6110,7 @@ def main():
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx),
                                    end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev,
                                    include_fq=bt_fq)
-            ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
+            ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else (re.search(r'第\d+段', bt_seg) or [''])[0]
             prog.empty()
             if stt.get('stopped'):
                 st.warning(f"⚠️ 回測提前結束：{stt['stopped']}")
