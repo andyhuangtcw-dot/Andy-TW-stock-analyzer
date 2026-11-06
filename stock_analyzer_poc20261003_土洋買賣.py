@@ -3364,7 +3364,11 @@ def market_position(mt, kp):
 #    ⚠️ 警示燈（槓桿清洗）：融資大減之後60日還再跌約3% → 減碼；ℹ️ 參考（避險不足）：效果不明，只顯示
 HEAT_RULES = (
     ('動能', '價格乖離', lambda g: (g('偏離200日均線%', 'p') or 0) >= 90 or (g('RSI14') or 0) > 75, '偏離200日均線在歷史前10%或 RSI>75'),
-    ('動能', '散戶槓桿', lambda g: (g('整體融資偏離一年均值%', 'p') or 0) >= 90 or (g('整體融資近20日變化%', 'p') or 0) >= 90, '整體融資偏離一年均值或近20日增幅在歷史前10%'),
+    # 2026-11-05：散戶槓桿加前提「指數在長期均線上方高檔」（偏離200日線≥第60百分位）；下跌中融資偏高是套牢不是追價
+    ('動能', '散戶槓桿', lambda g: ((g('整體融資偏離一年均值%', 'p') or 0) >= 90 or (g('整體融資近20日變化%', 'p') or 0) >= 90)
+                                and (g('偏離200日均線%', 'p') or 0) >= 60, '整體融資偏離一年均值或近20日增幅在歷史前10%，且指數在長期均線上方高檔'),
+    ('參考', '融資未清洗', lambda g: (g('距一年高點%') if g('距一年高點%') is not None else 0) <= -10
+                                 and (g('整體融資偏離一年均值%', 'p') or 0) >= 80, '指數距一年高點跌≥10%，整體融資偏離一年均值卻仍在歷史前20%（套牢、還沒去槓桿；驗證中）'),
     ('動能', '外資背離', lambda g: ((g('外資現貨近20日買賣超(億)', 'p') if g('外資現貨近20日買賣超(億)', 'p') is not None else 100) <= 10
                                  or (g('外資台指期淨未平倉(口)', 'p') if g('外資台指期淨未平倉(口)', 'p') is not None else 100) <= 10)
                                 and (g('偏離200日均線%', 'p') or 0) >= 60, '外資現貨或台指期淨部位在歷史最空的10%，指數卻仍在長期均線上方高檔'),
@@ -3434,10 +3438,11 @@ def dd_risk_lines(pred):
     hist = (f"；歷史上這個等級之後20日跌≥5%機率 {st_['precA']}%（{st_['liftA']}倍）、60日跌≥10%機率 {st_['precB']}%（{st_['liftB']}倍）"
             if st_.get('precA') is not None else '')
     marks = '　'.join(('🔴' if nm in d['on'] else '⚪') + nm for nm in d['all'])
-    if d.get('cut') or (d.get('apply') and d['k'] >= d['apply']['k']):
-        act = f"→ 依評分卡驗證過的規則（亮≥{d['apply']['k']}個），建議持股再減 {d['apply']['cut']}%"
-    elif d.get('apply'):
-        act = f"→ 減碼規則：亮≥{d['apply']['k']}個時減 {d['apply']['cut']}%（目前未達）"
+    ap = d.get('apply')
+    if ap and (d.get('cut') or dd_apply_hit(ap, d)):
+        act = f"→ 依評分卡驗證過的規則「{dd_rule_text(ap)}」，建議持股再減" + (f" {d['cut']}%" if d.get('cut') else '')
+    elif ap:
+        act = f"→ 減碼規則「{dd_rule_text(ap)}」（目前未達）"
     else:
         act = '→ 減碼規則回測未勝出，只供參考、不調整持股'
     return [f"・🛡️ **回撤風險 {icon}{d['level']}**（{d['k']}/5）：{marks}{hist} {act}"]
@@ -3452,11 +3457,11 @@ def heat_adjust(pos, pred):
     w = 1 if _warn_on(L) else 0
     d = (pred or {}).get('dd') or {}
     ap = d.get('apply')
-    cut = ap['cut'] if (ap and d.get('k', 0) >= ap['k']) else 0   # 2026-11-05 🛡️ 回撤風險：評分卡驗證過的減碼規則
+    cut = dd_cut_amount(ap, pos + 10 * (nh + nr - w)) if (ap and dd_apply_hit(ap, d)) else 0   # 2026-11-05 🛡️ 回撤風險：評分卡驗證過的減碼規則
     if not (nh or nr or w or cut):
         return pos, ''
     note = '、'.join(x for x in (f'動能燈 {nh} 盞 +{10 * nh}%' if nh else '', f'反彈燈 {nr} 盞 +{10 * nr}%' if nr else '', '警示燈（槓桿清洗）−10%' if w else '',
-                                 f"🛡️ 回撤風險{d.get('level')}（{d.get('k')}/5）−{cut}%" if cut else '') if x)
+                                 f"🛡️ {dd_rule_text(ap)}（回撤風險{d.get('level')} {d.get('k')}/5）−{cut}%" if cut else '') if x)
     return int(round(max(0, min(100, pos + 10 * (nh + nr - w) - cut)) / 5) * 5), note
 
 
@@ -3529,7 +3534,7 @@ DD_SIGS = (
     ('外資台指期淨空極端', lambda x: (x['pct']('外資台指期淨未平倉(口)') if x['pct']('外資台指期淨未平倉(口)') is not None else 1) <= 0.1),
     ('⚠️警示燈', lambda x: bool(x['warn'])),
 )
-DD_OVERLAYS = ((1, 10), (2, 10), (2, 20), (3, 20))   # (回撤訊號≥k 個, 減碼%)
+DD_OVERLAYS = ((1, 10), (2, 10), (2, 20), (2, 30), (3, 20), (3, 30), (3, 50))   # (回撤訊號≥k 個, 減碼%)；2026-11-06 加測減更多（30／50%）
 
 
 def dd_sig_on(ctx):
@@ -3590,6 +3595,8 @@ def dd_scorecard(cols, raw, X, c, q_risk):
             ('籌碼', '外資現貨20日賣超在歷史最多10%', pc('外資現貨近20日買賣超(億)') <= 0.1),
             ('籌碼', '外資台指期淨空單在歷史最多10%', pc('外資台指期淨未平倉(口)') <= 0.1),
             ('籌碼', '整體融資20日增幅在歷史前10%', pc('整體融資近20日變化%') >= 0.9),
+            ('籌碼', '融資未清洗（跌≥10%但融資偏離仍在前20%）', (rv('距一年高點%') <= -10) & (pc('整體融資偏離一年均值%') >= 0.8)),
+            ('籌碼', '融資偏離前10%但指數已跌≥10%（舊散戶槓桿會誤判加碼的情況）', (rv('距一年高點%') <= -10) & (pc('整體融資偏離一年均值%') >= 0.9)),
             ('🛡️ 回撤風險', '低（5個回撤訊號都不亮）', cnt == 0),
             ('🛡️ 回撤風險', '中（亮1個）', cnt == 1),
             ('🛡️ 回撤風險', '高（亮≥2個）', cnt >= 2),
@@ -3638,18 +3645,51 @@ def dd_scorecard(cols, raw, X, c, q_risk):
             if mt:
                 sims.append(dict(base=bn, rule=f'回撤訊號≥{k}個 減碼{cut}%', k=k, cut=cut, dsharpe=round(mt['sharpe'] - b0['sharpe'], 2),
                                  dmdd=round(mt['mdd'] - b0['mdd'], 2), **mt))
+        # 2026-11-05 加測：上櫃六年個股回測（含2022空頭）「大盤跌破60日線持股減半」年化最高、回撤 −30%→−20%
+        #   站回要連幾天才恢復（1／2／3日）三種都放進候選，由回測自動挑（2026-11-05：16年指數回測連3日反而較差，V型反彈少吃前幾天）
+        for n_ in DD_B60_NS:
+            bh_ = pd.Series(below60.astype(float)).rolling(n_, min_periods=1).max().values > 0
+            mt = _mp_metrics(np.where(bh_, bp * 0.5, bp), rd, mask)
+            if mt:
+                sims.append(dict(base=bn, rule=dd_rule_text(dict(ov='b60half', n=n_)), ov='b60half', n=n_, k=1, cut=50,
+                                 dsharpe=round(mt['sharpe'] - b0['sharpe'], 2), dmdd=round(mt['mdd'] - b0['mdd'], 2), **mt))
     out['sim'] = sims
     # 2026-11-05 依持股偏好各挑一個減碼規則（都要最大回撤改善≥2個百分點）：
     #   平衡＝平衡策略上夏普最高（夏普不降）；控制回撤＝平衡策略上回撤改善最多（夏普≥原本−0.02）；報酬優先＝滿倉上夏普最高（夏普不降）
     def pick(base, key, min_ds):
         c_ = [x for x in sims if x['base'].startswith(base) and x.get('k') and x['dsharpe'] >= min_ds and x['dmdd'] >= 2]
         b_ = max(c_, key=key) if c_ else None
-        return None if not b_ else dict(k=b_['k'], cut=b_['cut'], dsharpe=b_['dsharpe'], dmdd=b_['dmdd'], base=base)
-    out['apply_by'] = {'平衡': pick('平衡', lambda x: (x['sharpe'], x['dmdd']), 0.0),
-                       '控制回撤': pick('平衡', lambda x: (x['dmdd'], x['dsharpe']), -0.02),
-                       '報酬優先': pick('永遠滿倉', lambda x: (x['sharpe'], x['dmdd']), 0.0)}
+        return None if not b_ else dict(k=b_['k'], cut=b_['cut'], dsharpe=b_['dsharpe'], dmdd=b_['dmdd'], base=base, ov=b_.get('ov'), n=b_.get('n'))
+    out['apply_by'] = {'平衡': pick('平衡', lambda x: (x['sharpe'], x['dmdd'], x['cagr']), 0.0),
+                       '控制回撤': pick('平衡', lambda x: (x['dmdd'], x['dsharpe'], x['cagr']), -0.02),
+                       '報酬優先': pick('永遠滿倉', lambda x: (x['sharpe'], x['dmdd'], x['cagr']), 0.0)}
     out['apply'] = out['apply_by']['平衡']
     return out
+
+
+DD_B60_NS = (1, 2, 3)   # 2026-11-05 跌破60日線減半後，要連續幾天收在60日線上才恢復持股（候選，由回測挑）
+
+
+def dd_rule_text(ap):
+    if ap.get('ov') == 'b60half':
+        n_ = ap.get('n') or 1
+        return '跌破60日線 持股減半（' + ('站回1天就恢復' if n_ == 1 else f'連{n_}日站回才恢復') + '）'
+    return f"回撤訊號≥{ap['k']}個 減碼{ap['cut']}%"
+
+
+def dd_apply_hit(ap, d):
+    """規則今天是否成立 → 要扣的百分點（持股減半時依目前持股算）"""
+    if not ap:
+        return False
+    if ap.get('ov') == 'b60half':
+        return bool(d.get('below60h') if d.get('below60h') is not None else d.get('below60'))
+    return d.get('k', 0) >= ap['k']
+
+
+def dd_cut_amount(ap, pos):
+    if ap.get('ov') == 'b60half':
+        return int(pos - round(pos * 0.5 / 5) * 5) if pos is not None else 50
+    return ap['cut']
 
 
 def dd_apply_for(dc, pref=None):
@@ -3677,7 +3717,7 @@ def dd_scorecard_frame(ds):
     sm = pd.DataFrame([{'基礎策略': x['base'], '減碼規則': x['rule'], '年化報酬%': x['cagr'], '最大回撤%': x['mdd'], '夏普': x['sharpe'],
                         '夏普變化': x.get('dsharpe'), '回撤改善(百分點)': x.get('dmdd'), '平均持股%': x['avgpos']} for x in ds.get('sim') or []])
     ab = ds.get('apply_by') or {'平衡': ds.get('apply')}
-    f_ = lambda nm, a: (f"{nm}＝✅「回撤訊號≥{a['k']}個 減碼{a['cut']}%」（夏普 {a['dsharpe']:+.2f}、回撤改善 {a['dmdd']:.1f} 個百分點）" if a
+    f_ = lambda nm, a: (f"{nm}＝✅「{dd_rule_text(a)}」（夏普 {a['dsharpe']:+.2f}、回撤改善 {a['dmdd']:.1f} 個百分點）" if a
                         else f'{nm}＝❌ 沒有規則勝出（只顯示、不調整）')
     txt2 = ('減碼規則模擬（樣本外，隔天生效；依持股偏好各挑一個，回撤都要改善≥2個百分點）：'
             + '；'.join(f_(nm + crit, ab.get(nm)) for nm, crit in (('平衡', '（夏普最高）'), ('控制回撤', '（回撤改善最多）'), ('報酬優先', '（滿倉上夏普最高）')) if nm in ab)
@@ -4129,8 +4169,87 @@ def mp_walkforward(F, c, market):
         rep['ddcard'] = dd_scorecard(cols, raw, X, c, qw.get('risk'))
     except Exception as ex_:  # noqa
         rep['ddcard'] = dict(err=str(ex_)[:150])
-    rep['now'] = mp_reading(rep, {cols[j]: raw[-1, j] for j in range(len(cols))}, str(F.index[-1])[:10], below60=_below60(c))
+    rep['now'] = mp_reading(rep, {cols[j]: raw[-1, j] for j in range(len(cols))}, str(F.index[-1])[:10], below60=_below60(c), below60h=_b60hs(c))
+    try:   # 2026-11-05 近60日回撤訊號紀錄
+        rep['ddhist'] = mp_dd_history(rep, F, c)
+    except Exception:  # noqa
+        rep['ddhist'] = None
     return rep
+
+
+DD_HIST_N = 60   # 2026-11-05 近60個交易日回撤訊號亮燈紀錄
+
+
+def mp_dd_history(sc, F, c, n=DD_HIST_N):
+    """近 n 個交易日，每天用評分卡算一次讀數 → 各回撤訊號是否亮、警示燈、建議持股（目前選的偏好）。
+    百分位用評分卡的完整歷史分布（跟每天批次分析看到的讀數一樣），不是當時為止的分布"""
+    if not sc or not sc.get('models') or F is None or not len(F):
+        return None
+    cv = np.asarray(c.values if hasattr(c, 'values') else c, dtype=float)
+    out = []
+    for i in range(max(0, len(F) - n), len(F)):
+        try:
+            pr = mp_reading(sc, {nm: (F[nm].iloc[i] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[i])[:10],
+                            below60=_below60(cv[:i + 1]), below60h=_b60hs(cv[:i + 1]))
+        except Exception:  # noqa
+            continue
+        d = (pr or {}).get('dd') or {}
+        h = heat_lights(pr)
+        rk = ((pr or {}).get('models') or {}).get('risk') or {}
+        out.append(dict(date=str(F.index[i])[:10], close=round(float(cv[i]), 2), k=d.get('k'), level=d.get('level'),
+                        on=d.get('on') or [], all=d.get('all') or [], warn=bool(h and _warn_on(h[2])),
+                        q=rk.get('q'), pos=(pr or {}).get('pos'), cut=d.get('cut'), b60h=d.get('below60h')))
+    return out
+
+
+def nm_b(x):
+    return '跌破60日線' in x.get('on', [])
+
+
+def dd_history_frame(hist):
+    if not hist:
+        return None
+    alls = hist[-1]['all']
+    rows = []
+    prev = None
+    for x in hist[::-1]:   # 最新在上面
+        o = {'日期': x['date'], '加權指數': x['close'], '回撤風險': f"{ {'低': '🟢', '中': '🟡', '高': '🔴'}.get(x['level'], '')}{x['level'] or ''} {x['k']}/{len(alls)}"}
+        for nm in alls:
+            o[nm] = '🔴' if nm in x['on'] else '⚪'
+        o['風險模型級別'] = '' if x['q'] is None else str(x['q'])
+        o['建議持股%'] = str(x['pos']) if x['pos'] is not None else '—（溫度計規則）'
+        o['60日線狀態'] = ('線下' if nm_b(x) else ('站回確認中' if x.get('b60h') else '線上'))
+        o['減碼'] = f"−{x['cut']}%" if x.get('cut') else ''
+        rows.append(o)
+    df = pd.DataFrame(rows)
+    # 每個訊號「最近一次由暗轉亮」的日期；整段都亮著＝60日前就已亮
+    first = {}
+    for nm in alls:
+        prev, last = None, None
+        for x in hist:
+            on = nm in x['on']
+            if on and prev is False:
+                last = x['date']
+            prev = on
+        if last:
+            first[nm] = last
+        elif hist and nm in hist[-1]['on']:
+            first[nm] = f"{DD_HIST_N}日前已亮"
+    return df, first
+
+
+def _b60hs(c):
+    return {str(n_): _below60h(c, n_) for n_ in DD_B60_NS}
+
+
+def _below60h(c, n=None):
+    """近 n（預設3）個交易日只要有一天收在60日線下就算「還在線下」＝要連 n 天站回才恢復"""
+    n = n or 1
+    v = np.asarray(c.values if hasattr(c, 'values') else c, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 60 + n - 1:
+        return _below60(v)
+    return any(v[-1 - j] < v[-60 - j:len(v) - j].mean() for j in range(n))
 
 
 def _below60(c):
@@ -4207,7 +4326,7 @@ def _mp_read_model(m, pcts):
 
 # 2026-11-04 持股策略偏好（台股大盤回測 2009-11 起樣本外：控制回撤＝風險模型・積極 年化5.9%/回撤−13%；
 #   平衡＝風險模型・溫和 6.8%/−18%；報酬優先＝永遠滿倉 11.0%/−32%。台股波動率目標比滿倉差，不採用）
-MP_PREFS = ['平衡（風險模型・溫和，預設）', '控制回撤（評分卡自動挑選）', '報酬優先（永遠滿倉）']   # 2026-11-04 逆向加碼回測較差（夏普0.57＜滿倉0.69、回撤−25%）已移除，模擬表保留對照
+MP_PREFS = ['報酬優先（滿倉，跌破60日線減半；預設）', '平衡（風險模型・溫和）', '控制回撤（評分卡自動挑選）']   # 2026-11-05 預設改報酬優先   # 2026-11-04 逆向加碼回測較差（夏普0.57＜滿倉0.69、回撤−25%）已移除，模擬表保留對照
 
 
 def get_mp_pref():
@@ -4219,7 +4338,7 @@ def get_mp_pref():
         return MP_PREFS[0]
 
 
-def mp_reading(sc, vals, asof, below60=None):
+def mp_reading(sc, vals, asof, below60=None, below60h=None):
     """2026-11-05：外層加上 🛡️ 回撤風險（5個回撤訊號亮幾個）；評分卡驗證過的減碼規則成立時，平衡／控制回撤的建議持股再扣"""
     pr = _mp_reading0(sc, vals, asof)
     if not pr:
@@ -4235,11 +4354,14 @@ def mp_reading(sc, vals, asof, below60=None):
         dc = sc.get('ddcard') if isinstance(sc.get('ddcard'), dict) else {}
         lv = next((r for r in dc.get('rows') or [] if r.get('grp') == '🛡️ 回撤風險' and r['name'].startswith(dd_level(k))), None)
         ap = dd_apply_for(dc)
-        pr['dd'] = dict(k=k, level=dd_level(k), on=[nm for nm, o in L if o], all=[nm for nm, _ in L], below60=below60,
+        _n = (ap.get('n') or 1) if (ap and ap.get('ov') == 'b60half') else 1
+        _bh = below60h.get(str(_n), below60) if isinstance(below60h, dict) else (below60h if below60h is not None else below60)
+        pr['dd'] = dict(k=k, level=dd_level(k), on=[nm for nm, o in L if o], all=[nm for nm, _ in L], below60=below60, below60h=_bh,
                         stat=lv and dict(precA=lv.get('precA'), liftA=lv.get('liftA'), precB=lv.get('precB'), liftB=lv.get('liftB')), apply=ap)
-        if ap and k >= ap['k'] and pr.get('pos') is not None:
-            pr['dd']['cut'] = ap['cut']
-            pr['pos'] = max(0, pr['pos'] - ap['cut'])
+        if ap and dd_apply_hit(ap, pr['dd']) and pr.get('pos') is not None:
+            c_ = dd_cut_amount(ap, pr['pos'])
+            pr['dd']['cut'] = c_
+            pr['pos'] = max(0, pr['pos'] - c_)
     except Exception:  # noqa
         pass
     return pr
@@ -4259,7 +4381,7 @@ def _mp_reading0(sc, vals, asof):
     pk, pos = sc.get('pick'), None
     pref = get_mp_pref()
     if pref.startswith('報酬優先'):
-        return dict(asof=asof, models=rd, pos=100, valid=True, pick='報酬優先：永遠滿倉（只看個股訊號）', det=det)
+        return dict(asof=asof, models=rd, pos=100, valid=True, pick='報酬優先：平時滿倉（跌破60日線等回撤規則依評分卡減碼）', det=det)
     if pref.startswith('平衡') and rd.get('risk') and (sc['models'].get('risk') or {}).get('valid'):
         _nm = '溫和（50/55/60/65/70%）'
         return dict(asof=asof, models=rd, pos=MP_SCHEMES[_nm][rd['risk']['q'] - 1], valid=True, pick='平衡：風險模型・' + _nm, det=det)
@@ -4281,12 +4403,31 @@ def mp_build(token, years, log=None):
     return mp_walkforward(F, c, MP_MARKET)
 
 
+def _json_default(o):
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return None if not np.isfinite(o) else float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
+MP_SAVE_ERR = {'err': None}
+
+
 def mp_save(rep):
+    """2026-11-05：numpy 型別自動轉換；失敗原因記在 MP_SAVE_ERR 讓畫面顯示（以前失敗會靜默，看起來像「建不起來」）"""
     try:
+        txt = json.dumps(rep, ensure_ascii=False, default=_json_default)
         with open(MP_FILE, 'w', encoding='utf-8') as f:
-            json.dump(rep, f, ensure_ascii=False)
+            f.write(txt)
+        MP_SAVE_ERR['err'] = None
         return True
-    except Exception:  # noqa
+    except Exception as ex:  # noqa
+        MP_SAVE_ERR['err'] = str(ex)[:200]
         return False
 
 
@@ -4304,7 +4445,13 @@ def mp_live(token, sc):
         return None
     try:
         F, c = mp_features(mp_fetch(token, 1.7))
-        return mp_reading(sc, {nm: (F[nm].iloc[-1] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[-1])[:10], below60=_below60(c))
+        pr = mp_reading(sc, {nm: (F[nm].iloc[-1] if nm in F.columns else None) for nm in sc['cols']}, str(F.index[-1])[:10], below60=_below60(c), below60h=_b60hs(c))
+        try:   # 2026-11-05 近60日回撤訊號紀錄（批次分析時用最新資料重算）
+            if pr is not None:
+                pr['hist'] = mp_dd_history(sc, F, c)
+        except Exception:  # noqa
+            pass
+        return pr
     except Exception as ex:  # noqa
         return dict(err=str(ex)[:150])
 
@@ -4341,9 +4488,7 @@ def render_market_pred(st, ss, K):
                '模型樣本外有效（IC≥0.05、五級表現由差到好單調）才可用；再做持股策略模擬（積極／溫和兩種對照表、波動率目標法），'
                '夏普值勝過永遠滿倉且回撤較小的方式才拿來當建議持股，否則維持原本的溫度計＋K線規則。每次批次分析會多抓約' + MP_LIVE_COST + '的大盤資料。')
     st.radio('持股策略偏好（批次分析的建議持股用這個）', MP_PREFS, key='mp_pref', horizontal=True,
-             help='2026-11-04 台股大盤回測（2009-11 起樣本外）：平衡＝風險模型・溫和（持股50～70%，年化約6.8%、最大回撤約−18%）；'
-                  '控制回撤＝評分卡自動挑選（目前是風險模型・積極 30～80%，年化約5.9%、回撤約−13%）；報酬優先＝永遠滿倉（年化約11.0%、回撤約−32%）。2026-11-05 🛡️ 回撤減碼依偏好：平衡＝回撤訊號≥3個減20%（夏普0.72→0.76）、控制回撤＝≥2個減20%（回撤−17.7%→−14.1%）、報酬優先＝≥3個減20%（回撤−31.6%→−27.9%），以評分卡重建時的模擬為準。'
-                  '台股高風險期之後報酬並沒有比較差，減碼主要是減少震盪')
+             help='2026-11-05 台股大盤回測（2009-11 起樣本外，三種偏好都自動採用「跌破60日線持股減半」）：報酬優先（預設）＝平時滿倉、跌破60日線減半（年化約9.7%、最大回撤約−24%、夏普0.76）；平衡＝風險模型・溫和再減半（年化約6.0%、回撤約−13%、夏普0.77，平均持股僅約50%）；控制回撤＝評分卡自動挑選＋減半。個股層級（上櫃六年含2022空頭）：本月建議組合＋跌破60日線減半 年化約43%、回撤約−20%。以評分卡重建時的模擬為準')
     c1, c2 = st.columns([1, 2])
     yrs = c1.slider('歷史年數', 8, 20, 15, key='mp_years')
     if c2.button('🔮 執行大盤預測回測', type='primary', key='run_mp'):
@@ -4356,8 +4501,13 @@ def render_market_pred(st, ss, K):
                     rep = mp_build(tok, yrs)
                 ss['mp_rep'] = rep
                 _old = mp_load()
-                if rep.get('models') and (rep.get('valid') or not (_old and _old.get('valid'))):
-                    mp_save(rep)
+                if rep.get('msg'):
+                    st.error(f"❌ 評分卡沒有建立：{rep['msg']}")
+                elif rep.get('models') and (rep.get('valid') or not (_old and _old.get('valid'))):
+                    if mp_save(rep):
+                        st.success(f"✅ 評分卡已建立並儲存（{rep.get('built', '')}）；回到「📋 批次分析」重跑一次，大盤指引就會用新評分卡")
+                    else:
+                        st.error(f"❌ 評分卡算好了但存檔失敗：{MP_SAVE_ERR['err']}（可先按下方「下載評分卡」，再用「載入」上傳）")
                 elif rep.get('models'):   # 2026-11-03：新評分卡沒通過驗證 → 不覆蓋上一張通過的，批次分析的建議持股才不會大跳
                     st.warning(f"⚠️ 這次重建的評分卡沒有通過驗證，**批次分析繼續使用上一張通過的評分卡**（{_old.get('built', '')} 建立）。"
                                '下方顯示的是這次重建的結果，僅供比較；要改用這張，請下載後用下方「載入」上傳。')
@@ -4376,7 +4526,7 @@ def render_market_pred(st, ss, K):
     if not rep or not rep.get('models'):
         st.info('按「🔮 執行大盤預測回測」開始。' + ('（舊版評分卡格式，請重新執行）' if rep else ''))
         return
-    st.download_button('💾 下載評分卡（.json）', json.dumps(rep, ensure_ascii=False).encode('utf-8'),
+    st.download_button('💾 下載評分卡（.json）', json.dumps(rep, ensure_ascii=False, default=_json_default).encode('utf-8'),
                        file_name=f"大盤預測評分卡_{rep.get('market', '')}_{rep.get('built', '')}.json", key='mp_dl')
     st.markdown(f"**資料期間** {rep['start']} ～ {rep['end']}　｜　樣本外 {rep.get('oos_start', '--')} 起共 {rep['n_oos']} 天　｜　建立於 {rep['built']}")
     if rep.get('msg'):
@@ -4441,6 +4591,11 @@ def render_market_pred(st, ss, K):
             st.dataframe(_s, hide_index=True, use_container_width=True)
     else:
         st.caption('這張評分卡是舊版建立的，請重新按「🔮 執行大盤預測回測」' + (f"（{ddc['err']}）" if ddc else ''))
+    _hf = dd_history_frame(rep.get('ddhist'))
+    if _hf:
+        st.markdown(f'**📅 近{DD_HIST_N}個交易日回撤訊號紀錄**（建立評分卡當時；批次分析的「📋 大盤指引」下方有每天更新的版本）')
+        st.caption('最近一次亮起（由暗轉亮）：' + ('、'.join(f'{k} {v}' for k, v in _hf[1].items()) or '目前都沒亮'))
+        st.dataframe(_hf[0], hide_index=True, use_container_width=True, height=320)
     now = rep.get('now')
     if now:
         st.markdown(mp_panel_line(now))
@@ -4522,6 +4677,12 @@ def price_warn_tags(rw):
     return t
 
 
+# 2026-11-05 上櫃空頭段（2021-12～2023-11）交叉驗證：只有這兩組 S 在空頭四個半年全部為正（超額 +4.0／+5.7%、t 4.8／5.9），
+#    其他 S／W／M／#／F 空頭時超額≈0 或為負 → 標 🛡️全天候、本月建議優先排
+ALL_WEATHER_COMBOS = [["距52週高點≤5%", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
+                      ["創52週新高", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"]]
+
+
 def monthly_picks(df, n=None):
     """2026-11-04 主力＝命中 S 或 W、排除價格弱勢（60日低波動≤25%／距52週低點≤10%／中期動能弱）與 S命中但P/E<12倍，依多方力道取前 n 檔；
     籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%。
@@ -4530,7 +4691,9 @@ def monthly_picks(df, n=None):
     n = n or PICK_N
     if df is None or not len(df) or '_sw' not in df.columns:
         return None, None
-    main = df[df['_sw'] & ~df['_warn']].sort_values('多方力道', ascending=False)
+    main = df[df['_sw'] & ~df['_warn']].copy()
+    main['_aw'] = main['全天候'].eq('🛡️') if '全天候' in main.columns else False
+    main = main.sort_values(['_aw', '多方力道'], ascending=[False, False]).drop(columns=['_aw'])   # 🛡️全天候優先
     return main.head(n), main[main['_chipUp']].head(n)
 
 
@@ -4641,6 +4804,7 @@ def summary_frame(results, extras_flags, K, live=None):
         #   （⚠️外資減／融資減：上市扣分、上櫃加分，不再排除，只在「籌碼訊號」欄顯示）
         _rw = r['row']
         rec['_sw'] = bool(ms or mw)
+        rec['全天候'] = '🛡️' if any(K['STOCK_PICK_COMBOS'][i] in ALL_WEATHER_COMBOS for i in ms) else ''
         _pw = price_warn_tags(_rw)
         rec['價格訊號'] = ' '.join(_pw)
         rec['_warn'] = bool(_pw or (ms and not mw and isnum(_rw.get('pe')) and 0 < _rw['pe'] < 12))
@@ -5504,7 +5668,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-05 加測2022空頭段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-06 加測減碼30／50%'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -5775,6 +5939,13 @@ def render_batch(st, ss, K):
     (st.success if _ml[-1].startswith('🟢') else st.error if _ml[-1].startswith('🔴') else st.info)('\n\n'.join(_ml))
     with st.expander('📋 大盤指引（白話解讀與觀察重點）', expanded=True):
         st.markdown('\n\n'.join(market_guide_lines(_mt, _kp, next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None))))
+    _mpr0 = next((r.get('mkt_pred') for r in results if r.get('mkt_pred')), None)
+    _hf = dd_history_frame((_mpr0 or {}).get('hist'))
+    if _hf:
+        with st.expander(f'📅 近{DD_HIST_N}個交易日回撤訊號紀錄（每個訊號哪天亮、建議持股怎麼變）', expanded=False):
+            st.caption('最近一次亮起（由暗轉亮）：' + ('、'.join(f'{k} {v}' for k, v in _hf[1].items()) or '目前都沒亮')
+                       + '。百分位用評分卡完整歷史分布；建議持股依目前選的持股偏好')
+            st.dataframe(_hf[0], hide_index=True, use_container_width=True, height=360)
     if '組合型態' in df.columns and len(df):
         _bc = st.columns(len(STYLE_LISTS))
         for (_sty, _ln), _c in zip(STYLE_LISTS, _bc):
@@ -5802,6 +5973,7 @@ def render_batch(st, ss, K):
         st.dataframe(t1, hide_index=True, use_container_width=True, height=240)
         st.dataframe(t2, hide_index=True, use_container_width=True, height=240)
         st.caption(f"🔵 W＝回測高勝率（{len(K.get('BT_WIN_COMBOS', []))}組，青色）：三年回測任一天期勝率>55%，且三年各自依日 t≥2、六個半年至少五個為正；標 ⏱ 的是擇時型。"
+                   "⚠️ 2026-11-05 上櫃空頭段（2021-12～2023-11）：W 清單沒有一組 t≥2，只買 W 的組合 2022 年 −35%（大盤代理 −24%）→ 空頭時失效，只適合多頭。"
                    f"　🔴 F＝回測飆股（{len(K.get('BT_HOT_COMBOS', []))}組，粉紅色）：10/20日飆股比例>10%、飆股次數≥10，且三段飆股比例都≥2倍基準。摘要表每類只顯示最強的{BT_HIT_SHOW}個，其餘以 +N 表示。"
                    "　🔢 命中類別數＝S/#/M/W/F 五類中命中幾類；同類組合常共用同一訊號，類別數比總命中數更能反映強度（回測：≥3類 台股20日超額約+2~4%、美股+0.6~1.8%，但波動也較大）。"
                    "　🏷️ 組合型態（依命中類別組合分級）：" + '　'.join(f"{COMBO_STYLE_ICON[k]}＝{'、'.join(c for c, v in COMBO_STYLE_RULES.items() if v == k)}（{COMBO_STYLE_NOTE[k]}）" for k in ('進攻', '穩健', '彩券')) + "；其他組合不標示。")
@@ -5820,10 +5992,13 @@ def render_batch(st, ss, K):
             st.caption('主力＝命中 S 或 W、排除「價格訊號」⚠️（低波動／近52週低／動能弱）與 S命中但P/E<12倍，依多方力道取前20檔；'
                        '籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%（需勾「🧮 進階籌碼」）。⚠️外資減／融資減只顯示、不排除（上市扣分、上櫃反而加分）。'
                        '上櫃六段（699檔、沒參與建清單的新股票）組合模擬：主力年化約78%、夏普1.49、回撤約−24%（等權全部約21%／0.88／−31%）；三年剛好偏多頭，看相對比較即可。'
+                       '🛡️全天候＝命中 S1／S2（52週高點附近＋近3日跳空＋營收優於股價），空頭也有效，排在最前面。'
+                       '上櫃空頭段回測（2021-12～2023-11）：本月建議 2022 年 −20%（大盤代理 −24%、只買 W −35%），空頭段最大回撤約 −30%；'
+                       '加上「大盤跌破60日線持股減半」2022 年 −11%、回撤約 −20%，六年合併年化反而最高（約43%）。'
                        '組合層級規則回測（上市＋上櫃三年）：「組合自高點回落≥10～20%降到50%持股」「大盤跌破60日線只取前10檔」都比原本差，不採用；'
                        '「大盤跌破60日線持股50%」夏普持平、回撤少約3個百分點，已包含在大盤指引的 🛡️ 回撤風險裡。'
                        '**出場：抱滿20個交易日再換股，不設固定停損**（台股上櫃：抱20日 +4.5%／筆，停損−8% 只剩 +3.5%、停利+20% +2.6%、移動停損10% +3.0%；美股結論相同）。')
-            _cols = [c for c in ('類股', '股票', '名稱', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '籌碼訊號', '價格訊號') if c in df.columns]
+            _cols = [c for c in ('全天候', '類股', '股票', '名稱', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '籌碼訊號', '價格訊號') if c in df.columns]
             _a, _b = st.columns(2)
             _a.markdown('**🚀 主力組合**（S 或 W，排除價格弱勢）')
             _a.dataframe(_pm[_cols], hide_index=True, use_container_width=True)
