@@ -4592,7 +4592,7 @@ def render_market_pred(st, ss, K):
         st.dataframe(pd.DataFrame([dict(級別=f'第{k + 1}級' + ('（最差）' if k == 0 else '（最好）' if k == 4 else ''), 天數=x['n'],
                                         未來20日平均報酬=x['ret'], 未來40日平均報酬=x.get('ret40'), 未來60日平均報酬=x.get('ret60'),
                                         上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 平均最大跌幅=x['mdd'],
-                                        建議持股=((rep['pick']['pos'][k] if rep.get('pick') and rep['pick'].get('model') == kd else '—') if m['valid'] else '不採用'))
+                                        建議持股=(str(rep['pick']['pos'][k]) if rep.get('pick') and rep['pick'].get('model') == kd else '—') if m['valid'] else '不採用')
                                    for k, x in enumerate(m['quint'])]
                                   + [dict(級別='全部（永遠持有）', 天數=rep['n_oos'], 未來20日平均報酬=b['ret'], 未來40日平均報酬=b.get('ret40'),
                                           未來60日平均報酬=b.get('ret60'), 上漲機率=b['up'],
@@ -5496,6 +5496,7 @@ def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, ch
     K線等大資料直接丟掉 → 記憶體只跟候選股數量有關。每檔的多方力道／命中只看自己的資料，結果跟一次跑完全市場相同"""
     log = log or (lambda m: None)
     cands, pool, nb = [], [], (len(stocks) + chunk - 1) // chunk
+    diag = dict(n=len(stocks), ok=0, hit=0, warn=0, lowpe=0)   # 2026-11-12 跑完顯示候選股篩選統計，0 檔時知道卡在哪
     _held = set(str(x) for x in ((load_pick_meta() or {}).get('ids') or []))
     for k in range(nb):
         part = stocks[k * chunk:(k + 1) * chunk]
@@ -5503,6 +5504,12 @@ def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, ch
                             (lambda i, n, k=k: progress(k * chunk + i, len(stocks))) if progress else None, mkt=False)
         ensure_flagsets(res)
         for r in res:
+            diag['ok'] += 1
+            _rw = r.get('row') or {}
+            if matched_combos(_rw, K['STOCK_PICK_COMBOS']) or matched_combos(_rw, K.get('BT_WIN_COMBOS', [])):
+                diag['hit'] += 1
+                if price_warn_tags(_rw, r.get('stockId'), K.get('TPEX_LIST')):
+                    diag['warn'] += 1
             if pick_candidate(r, K) or r['stockId'] in _held:   # 2026-11-08 持股也留完整結果（報酬監控＋換股檢查要用）
                 cands.append(r)
             else:
@@ -5520,6 +5527,7 @@ def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, ch
     except Exception:  # noqa
         mcf = {}
     attach_mkt(cands, token, bm, mcf)
+    full_market_analyze.diag = diag
     return cands, pool
 
 
@@ -6011,7 +6019,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-12 十年回測段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-12 全市場跑完顯示篩選統計'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6095,6 +6103,7 @@ def main():
         run_batch = st.button('🔍 批次分析', type='primary', use_container_width=True, key='run_batch')
         with st.expander('🌐 全市場分批自動跑（記憶體不夠一次跑完時用）', expanded=False):
             st.selectbox('股票池', ['上市清單', '上櫃清單', '上市+上櫃'], key='fm_univ')
+            st.caption('⚠️ 全市場分批會自動打開「P/E、營收、均價YoY、三大法人」4項延伸資料（本月建議的 S／W 組合與排除規則要用），每檔約多4次API；免費額度時要分好幾個小時跑完。')
             st.number_input('每批檔數', 50, 600, FULL_CHUNK, 50, key='fm_chunk', help='每批算完只留本月建議候選股的完整結果，其他股票丟掉K線只留摘要')
             st.caption('依序分批分析整個股票池（上面勾的API選項一樣適用），最後只保留本月建議候選股，'
                        '「📦 本月建議組合」就是全市場前20檔。上市約900檔、上櫃約800檔，時間跟一般批次分析一樣看API額度。')
@@ -6226,14 +6235,21 @@ def main():
 
             def _prog(i, n):
                 prog.progress(min(1.0, i / n), text=f'🌐 全市場分批分析中：{i} / {n}')
+            # 2026-11-12 本月建議要用的延伸資料一律打開：月營收＋均價YoY（乖離度，S／W 很多組合要用）、三大法人（上市排除法人賣超）、P/E（只命中S且P/E<12排除）
+            ex_flags = dict(ex_flags, rev=True, pxyoy=True, inst=True, pe=True)
             cands, pool = full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, req_delay, K,
                                               int(ss.get('fm_chunk') or FULL_CHUNK), _log, _prog)
             prog.empty()
             logbox.empty()
             ss['batch'] = dict(results=cands, extras=ex_flags, vpp=vpp, pool=pool + cands,
                                full=dict(n=len(stocks), ok=len(pool) + len(cands), cand=len(cands)))
+            _dg = getattr(full_market_analyze, 'diag', {}) or {}
+            ss['full_msg'] = (f"🌐 全市場分批自動跑完成（{dt.datetime.now().strftime('%m/%d %H:%M')}）：股票池 {_dg.get('n', len(stocks)):,} 檔 → "
+                              f"成功抓到資料 {_dg.get('ok', 0):,} 檔 → 命中 S 或 W {_dg.get('hit', 0):,} 檔 → 其中價格弱勢／法人賣超排除 {_dg.get('warn', 0):,} 檔 → "
+                              f"本月建議候選 {len(cands)} 檔")
             if not cands:
-                st.error('全市場沒有本月建議候選股（或所有股票都抓不到資料）')
+                st.error('全市場沒有本月建議候選股：' + ss['full_msg'] + '。成功檔數很少＝API 額度用完或抓取失敗（等一小時再跑）；'
+                         '命中 S／W 很少＝側欄沒勾「月營收／乖離度」等延伸資料（很多 S／W 組合要用）')
             elif ss.get('auto_track', True):
                 recs = hit_records(cands, K, get_live_combo_stats(ss, K))
                 added = append_hit_log(recs)
@@ -6305,6 +6321,8 @@ def get_live_combo_stats(ss, K):
 
 def render_batch(st, ss, K):
     B = ss.get('batch')
+    if ss.get('full_msg'):
+        (st.success if B and B.get('results') else st.error)(ss['full_msg'])
     if not B or not B['results']:
         st.info('在左側輸入 FinMind API Token 與股票代號，點擊「🔍 批次分析」即可開始。')
         st.markdown('#### 📘 每月操作流程（2026-11-06 回測定案的做法）')
