@@ -5488,7 +5488,28 @@ def pick_candidate(r, K):
     return not (ms and not mw and isnum(rw.get('pe')) and 0 < rw['pe'] < 12)
 
 
-FULL_CHUNK = 250   # 2026-11-06 全市場分批：每批幾檔（Streamlit Cloud 記憶體約1GB）
+FULL_CHUNK = 150   # 2026-11-12 全市場分批：每批幾檔（250 會記憶體超限重開，改 150）
+
+
+FM_CKPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fm_ckpt.json.gz')   # 2026-11-12 伺服器端自動存進度（session 斷線但 App 沒重開時可還原）
+
+
+def fm_ckpt_save(data, done_n, cand_n):
+    try:
+        with open(FM_CKPT_FILE, 'wb') as fh:
+            fh.write(data)
+        with open(FM_CKPT_FILE + '.meta', 'w', encoding='utf-8') as fh:
+            json.dump(dict(time=dt.datetime.now().strftime('%m/%d %H:%M'), done=done_n, cand=cand_n), fh)
+    except Exception:  # noqa
+        pass
+
+
+def fm_ckpt_meta():
+    try:
+        with open(FM_CKPT_FILE + '.meta', 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:  # noqa
+        return None
 
 
 def fm_ckpt_bytes(state):
@@ -6065,7 +6086,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-12 全市場進度檔下載接續'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-12 全市場伺服器自動存進度'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6157,6 +6178,15 @@ def main():
                              help='全市場分批每跑完一批，畫面會出現「💾 下載進度檔」。App 因記憶體超限重開時，結果會消失；把最後下載的進度檔傳到這裡再按開始，'
                                   '已分析的股票不用重跑（候選股會重新分析，數量少）。全部跑完的結果檔也可以傳，幾分鐘就能還原本月建議組合。')
             run_full = st.button('🌐 開始全市場分批分析', use_container_width=True, key='run_full')
+            _fmm = fm_ckpt_meta() if os.path.exists(FM_CKPT_FILE) else None
+            if _fmm:
+                if st.button(f"♻️ 還原／接續上次全市場分析（{_fmm.get('time')}，已分析 {_fmm.get('done', 0):,} 檔、候選 {_fmm.get('cand', 0)} 檔）",
+                             use_container_width=True, key='fm_restore'):
+                    run_full = True
+                    ss['fm_restore_go'] = True
+                else:
+                    ss['fm_restore_go'] = False
+                st.caption('畫面結果消失但 App 沒有整台重開時可用（伺服器上自動存的進度）；App 整台重開會清掉，要用下載的進度檔')
         cg, cv = st.columns(2)
         if cg.button('🔥 漲幅前100', use_container_width=True):
             ss['pending_top100'] = 'gain'
@@ -6286,6 +6316,15 @@ def main():
                 prog.progress(min(1.0, i / n), text=f'🌐 全市場分批分析中：{i} / {n}')
             # 2026-11-12 進度檔：上傳了就接續；每批跑完提供下載
             _resume = None
+            if ss.get('fm_restore_go') and ss.get('fm_resume') is None and os.path.exists(FM_CKPT_FILE):   # ♻️ 伺服器端進度
+                try:
+                    with open(FM_CKPT_FILE, 'rb') as fh:
+                        _resume = fm_ckpt_load(fh)
+                    if _resume.get('stocks'):
+                        stocks = list(_resume['stocks'])
+                    st.info(f"♻️ 從伺服器上的進度接續：已分析 {len(_resume.get('done') or []):,}／{len(stocks):,} 檔")
+                except Exception as _ex:  # noqa
+                    _resume = None
             if ss.get('fm_resume') is not None:
                 try:
                     ss['fm_resume'].seek(0)
@@ -6303,6 +6342,7 @@ def main():
                 _ckn[0] += 1
                 data = fm_ckpt_bytes(state)
                 ss['fm_ckpt_last'] = data
+                fm_ckpt_save(data, len(state['done']), len(state['cand_ids']))
                 _ckbox.download_button(f'💾 下載進度檔（第 {k}/{nb} 批完成，已分析 {len(state["done"]):,} 檔；App 重開後上傳可接續）', data=data,
                                        file_name=f'全市場進度_{dt.date.today():%Y%m%d}_{len(state["done"])}檔.json.gz', mime='application/gzip',
                                        key=f'fm_ck_{_ckn[0]}_{int(time.time())}', on_click='ignore', use_container_width=True)
