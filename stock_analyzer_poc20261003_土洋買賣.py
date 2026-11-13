@@ -1932,9 +1932,25 @@ def fetch_price(sid, token, days):
     return out
 
 
+def split_adjust(closes):
+    """2026-11-13 分割／合併還原：單日收盤跌破一半或漲超過一倍（台股漲跌幅 10%，正常不可能）視為股票分割，把之前的價格等比例調整。
+    0050 在 2025-06 一拆四，未還原時大盤 20／60 日線訊號錯了約兩個月（回測顯示會讓減碼規則誤判）"""
+    c = [float(x) if x else x for x in closes]
+    for i in range(len(c) - 1, 0, -1):
+        if c[i] and c[i - 1]:
+            r = c[i] / c[i - 1]
+            if r < 0.5 or r > 2.0:
+                k = round(1 / r) if r < 1 else 1 / round(r)
+                for j in range(i):
+                    if c[j]:
+                        c[j] = c[j] / k if r < 1 else c[j] * round(r)
+    return c
+
+
 def fetch_benchmark(token, days, bid='0050'):
     rows = fetch_price(bid, token, days)
-    return Benchmark([dict(date=r['date'], close=r['close']) for r in rows])
+    adj = split_adjust([r['close'] for r in rows])
+    return Benchmark([dict(date=r['date'], close=c) for r, c in zip(rows, adj)])
 
 
 IND_GENERIC = {'電子工業', 'ETF', 'Index', '大盤', '所有證券', '存託憑證', '受益證券', '上櫃指數股票型基金(ETF)', '指數投資證券(ETN)'}
@@ -4934,11 +4950,25 @@ def mark_star(main, k=STAR_N):
     top = main.head(PICK_N)
     b60 = pd.to_numeric(top['_b60'], errors='coerce') if '_b60' in top.columns else pd.Series(dtype=float)
     up = None if not b60.notna().any() else bool(b60.mean() >= 0.5)
-    if up is False:
-        return main, up
+    # 2026-11-13 跌破60日線也照樣標精選5（只把持股減半，不換成20檔）：台股上市＋上櫃5年逐日回測，
+    #    「一律5檔、跌破減半」年化 49.3%／回撤 −35.3%，現行「跌破換20檔半倉」48.8%／−36.7%，操作也簡單（跌破時不用一次買15檔新股）
     v = pd.to_numeric(top['_vol'], errors='coerce').fillna(1e9) if '_vol' in top.columns else 0
     sel = top.assign(_v=v).sort_values(['S+W命中數', '_v'], ascending=[False, True]).head(k).index
     main.loc[sel, '精選'] = '⭐'
+    # 2026-11-13 精選5 建議權重：依命中數（台股上市＋上櫃5年逐日回測 年化 上市 35.4→37.9%、上櫃 68.2→83.7%，回撤不變）；
+    #    命中數×低波動（1/60日波動）報酬略低但回撤最小、夏普最高。單檔上限 35%
+    main['建議權重(命中)'] = ''
+    main['建議權重(命中×低波動)'] = ''
+    if len(sel):
+        nh = pd.to_numeric(main.loc[sel, 'S+W命中數'], errors='coerce').fillna(1).clip(lower=1).to_numpy(float)
+        vv = pd.to_numeric(main.loc[sel, '_vol'], errors='coerce') if '_vol' in main.columns else pd.Series(np.nan, index=sel)
+        vv = vv.fillna(vv.median() if vv.notna().any() else 30).clip(lower=10).to_numpy(float)
+        for col, w in (('建議權重(命中)', nh), ('建議權重(命中×低波動)', nh / vv)):
+            w = w / w.sum()
+            for _ in range(10):
+                w = np.minimum(w, 0.35)
+                w = w / w.sum()
+            main.loc[sel, col] = [f'{x * 100:.0f}%' for x in w]
     return main, up
 
 
@@ -6041,7 +6071,7 @@ def pick_tracker(results, meta):
     if not ser:
         return None
     nav = pd.concat(ser, axis=1).sort_index().ffill().mean(axis=1)
-    out = dict(date=d0, n=len(ser), total=len(meta['ids']), days=len(nav) - 1, ret=(nav.iloc[-1] - 1) * 100,
+    out = dict(date=d0, last=str(nav.index[-1])[:10], n=len(ser), total=len(meta['ids']), days=len(nav) - 1, ret=(nav.iloc[-1] - 1) * 100,
                up=sum(1 for x in each if x[2] > 0), each=sorted(each, key=lambda x: -x[2]), mkt=None)
     r0 = next((r for r in results if r.get('bm_close') and r.get('bm_date')), None)
     if r0:
@@ -6067,11 +6097,11 @@ def pick_tracker_text(t):
     elif ex >= 0:
         judge = '　✅ 跑贏大盤'
     else:
-        judge = '　⚠️ 落後大盤（單期落後很常見：歷史上約 1/3～1/2 的期數輸大盤，不必提前出場，每10日照規則做換股檢查）'
+        judge = '　⚠️ 落後大盤（單期落後很常見：歷史上約 1/3～1/2 的期數輸大盤，不必提前出場，每月11日、26日照規則做換股檢查）'
     top = '、'.join(f"{nm} {v:+.1f}%" for _, nm, v in t['each'][:3])
     bot = '、'.join(f"{nm} {v:+.1f}%" for _, nm, v in t['each'][-3:][::-1])
     return (f"📍 組合報酬監控（{t['date']} 存成我的清單4，{t['n']}/{t['total']} 檔有資料）：持有第 {t['days']} 個交易日"
-            + ('（已滿10日，該做換股檢查）' if t['days'] >= 10 else f"（第10日做換股檢查，還有 {10 - t['days']} 日）")
+            + (lambda c: (f"（**已到檢查日 {c[0][5:]}，該做換股檢查**）" if c[1] else f"（下次換股檢查日 {c[0][5:]}；每月11日、26日）") if c[0] else '')(check_info(t['date'], t.get('last')))
             + f"\n\n・組合累計 {col(t['ret'])}"
             + (f"｜同期大盤(0050) {col(t['mkt'])}｜超額 {col(ex)}" if ex is not None else '')
             + f"｜上漲 {t['up']}/{t['n']} 檔｜歷史同期平均約 {exp}{judge}"
@@ -6094,12 +6124,33 @@ def pick_rebalance(meta, elig, analyzed, n=None):
     return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=keep + unk + buy)
 
 
-def pick_rebalance_text(rb, days, names):
+CHECK_DAYS = (11, 26)   # 2026-11-13 固定換股檢查日：每月11日（月營收10日前公布完，第一個用得到最新營收的日子）、26日；遇假日順延
+
+
+def check_info(d0, last):
+    """存檔日 d0 之後的第一個檢查日，以及最新資料日 last 是否已到（含）。上市＋上櫃5年回測：11／26日 年化 113%、回撤 −24.7%（前後半段都穩），
+    隨意起始日 41～121%；一個月只換一次較差（73%）"""
+    try:
+        a = dt.date.fromisoformat(str(d0)[:10])
+        b = dt.date.fromisoformat(str(last)[:10])
+    except Exception:  # noqa
+        return None, False
+    x = a + dt.timedelta(days=1)
+    for _ in range(40):
+        if x.day in CHECK_DAYS:
+            break
+        x += dt.timedelta(days=1)
+    return x.isoformat(), b >= x
+
+
+def pick_rebalance_text(rb, days, names, chk=None):
     if not rb:
         return None
     nm = lambda L: '、'.join(f"{s} {names.get(s, '')}".strip() for s in L) or '無'
-    due = days is not None and days >= 10
-    return (f"🔄 換股檢查（每10個交易日一次{'；**已到檢查日**' if due else f'；還有 {10 - days} 日' if days is not None else ''}）："
+    due = bool(chk and chk[1])
+    _nx = (chk or (None,))[0]
+    _hd = ('；**已到檢查日 ' + _nx[5:] + '**' if due else '；下次檢查日 ' + _nx[5:]) if _nx else ''
+    return (f"🔄 換股檢查（每月11日、26日，遇假日順延{_hd}）："
             f"續抱 {len(rb['keep'])} 檔｜**該賣 {len(rb['sell'])} 檔**：{nm(rb['sell'])}｜**該補 {len(rb['buy'])} 檔**：{nm(rb['buy'])}"
             + (f"｜⚠️ 這次沒分析到 {len(rb['unk'])} 檔（先續抱，請把它們一起跑）：{nm(rb['unk'])}" if rb['unk'] else '')
             + '\n\n（只賣掉已不在本月建議清單的股票，還在清單上就算掉出前20也續抱；不到檢查日不用動）')
@@ -6119,7 +6170,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-12 進度檔股票池聯集＋檔名標市場'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-13 換股檢查日11／26'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6472,7 +6523,7 @@ def render_batch(st, ss, K):
     if not B or not B['results']:
         st.info('在左側輸入 FinMind API Token 與股票代號，點擊「🔍 批次分析」即可開始。')
         st.markdown('#### 📘 每月操作流程（2026-11-06 回測定案的做法）')
-        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **⚖️ 決定總持股**　看批次分析上方「📋 大盤指引」的建議持股％：加權指數收盤跌破60日線 → 持股減半，站回就恢復。20檔等權重分配這筆資金。\n4. **⏳ 持有與換股（每兩週檢查）**　每10個交易日重跑一次：持股還在本月建議清單上（不必前20）就續抱，掉出清單的賣掉，用新名單裡排名最前、還沒持有的補足20檔（📍 組合報酬監控下方的「🔄 換股檢查」會直接列出，按「套用換股」更新清單4）。不要每天跟著新名單換（名單每天約變動25～30%，換股成本會吃掉報酬）。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
+        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **⚖️ 決定總持股**　看批次分析上方「📋 大盤指引」的建議持股％：加權指數收盤跌破60日線 → 持股減半，站回就恢復。資金等權重買 ⭐精選5（跌破60日線時同樣5檔各減半，不換成20檔）；想分散就買主力20檔。\n4. **⏳ 持有與換股（每月11日、26日檢查，遇假日順延）**　11日是月營收公布完後第一天。檢查日重跑一次：持股還在本月建議清單上（不必前20）就續抱，掉出清單的賣掉，用新名單裡排名最前、還沒持有的補足20檔（📍 組合報酬監控下方的「🔄 換股檢查」會直接列出，按「套用換股」更新清單4）。不要每天跟著新名單換（名單每天約變動25～30%，換股成本會吃掉報酬）。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
         st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
@@ -6544,7 +6595,7 @@ def render_batch(st, ss, K):
 
     _pm, _pc = monthly_picks(df)
     if _pm is not None:
-        with st.expander(f'📦 本月建議組合（主力 {len(_pm)} 檔／籌碼加持 {len(_pc)} 檔；每10個交易日檢查、還在清單就續抱、等權重）', expanded=False):
+        with st.expander(f'📦 本月建議組合（主力 {len(_pm)} 檔／籌碼加持 {len(_pc)} 檔；每月11日、26日檢查、還在清單就續抱）', expanded=False):
             st.caption('主力＝命中 S 或 W、排除「價格訊號」⚠️（低波動／近52週低／動能弱）與 S命中但P/E<12倍，依多方力道取前20檔；'
                        '籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%（需勾「🧮 進階籌碼」）。⚠️外資減／融資減只顯示、不排除（上市扣分、上櫃反而加分）。'
                        '上櫃六段（699檔、沒參與建清單的新股票）組合模擬：主力年化約78%、夏普1.49、回撤約−24%（等權全部約21%／0.88／−31%）；三年剛好偏多頭，看相對比較即可。'
@@ -6553,12 +6604,16 @@ def render_batch(st, ss, K):
                        '加上「大盤跌破60日線持股減半」2022 年 −11%、回撤約 −20%，六年合併年化反而最高（約43%）。'
                        '組合層級規則回測（上市＋上櫃三年）：「組合自高點回落≥10～20%降到50%持股」「大盤跌破60日線只取前10檔」都比原本差，不採用；'
                        '「大盤跌破60日線持股50%」夏普持平、回撤少約3個百分點，已包含在大盤指引的 🛡️ 回撤風險裡。'
-                       '**換股：每10個交易日檢查，還在本月建議清單（不必前20）就續抱、掉出清單才賣**（2026-11-08 回測比每20日全換年化多約 +5～+15 個百分點；只買10檔回撤變深、不建議）；**不設固定停損**（台股上櫃：抱20日 +4.5%／筆，停損−8% 只剩 +3.5%、停利+20% +2.6%、移動停損10% +3.0%；美股結論相同）。')
-            _cols = [c for c in ('精選', '全天候', '🎯高勝率', '⚠️高回撤', 'S+W命中數', '類股', '股票', '名稱', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '籌碼訊號', '價格訊號') if c in df.columns]
+                       '**換股：每月11日、26日檢查（遇假日順延），還在本月建議清單（不必前20）就續抱、掉出清單才賣**（2026-11-08 回測比每20日全換年化多約 +5～+15 個百分點；只買10檔回撤變深、不建議）；**不設固定停損**（台股上櫃：抱20日 +4.5%／筆，停損−8% 只剩 +3.5%、停利+20% +2.6%、移動停損10% +3.0%；美股結論相同）。')
+            _cols = [c for c in ('精選', '建議權重(命中)', '建議權重(命中×低波動)', '全天候', '🎯高勝率', '⚠️高回撤', 'S+W命中數', '類股', '股票', '名稱', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '籌碼訊號', '價格訊號') if c in df.columns]
             _a, _b = st.columns(2)
-            _a.markdown('**🚀 主力組合**（S 或 W，排除價格弱勢；上市另排除三大法人近3月賣超）' + ('　⭐精選5：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _pm[_pm['精選'] == '⭐'].iterrows()) if (_pm['精選'] == '⭐').any() else ('　⭐精選5：大盤跌破60日線，不集中，20檔等權' if len(_pm) else '')))
+            _star = _pm[_pm['精選'] == '⭐']
+            _b60m = pd.to_numeric(_pm['_b60'], errors='coerce').mean() if '_b60' in _pm.columns else float('nan')
+            _a.markdown('**🚀 主力組合**（S 或 W，排除價格弱勢；上市另排除三大法人近3月賣超）'
+                        + (('　⭐精選5：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _star.iterrows())
+                            + ('　（大盤跌破60日線：這5檔各減半持有）' if _b60m < 0.5 else '')) if len(_star) else ''))
             _a.caption('⚠️高回撤＝命中 W14／S6／W17（強勢突破盤＋地量＋短線過熱／創52週新高／近3日漲停）：20日內平均最大回撤約 −15%（全體 −8.7%），但報酬也最高（+9～11%），買了要能忍震盪，不必排除')
-            _a.caption('⭐精選5＝主力20檔裡命中 S／W 組合數最多的5檔（同數選60日波動低）；只在大盤站上60日線時標，跌破就回到20檔等權。回測（美股三組＋台股上櫃三年）多頭年化多 +13～+58 個百分點、回撤深 6～16 點；空頭時集中5檔反而虧更多（台股上櫃 2022 −16% 對 20檔 +4%），所以跌破60日線不標')
+            _a.caption('⭐精選5＝主力20檔裡命中 S／W 組合數最多的5檔（同數選60日波動低）；大盤跌破60日線時同樣這5檔、只把持股減半（不換成20檔）。「建議權重(命中)」依命中組合數分配（回測年化 上市 +2.5、上櫃 +15 個百分點，回撤不變）；「命中×低波動」報酬略低但回撤最小，單檔上限35%。回測（台股上市＋上櫃5年逐日）：5檔＋跌破減半 年化約 49%（20檔約 40%），最大回撤 −35%（20檔 −33%）')
             _a.dataframe(_pm[_cols], hide_index=True, use_container_width=True)
             _b.markdown('**💰 籌碼加持**（主力＋外資持股或融資增加）' + ('' if len(_pc) else '　— 沒有符合的股票，或沒勾「🧮 進階籌碼」'))
             if len(_pc):
@@ -6577,7 +6632,7 @@ def render_batch(st, ss, K):
             _rb = pick_rebalance(_meta, _elig, _anz)
             if _rb:
                 _nmap = {str(r['stockId']): r.get('name', '') for r in results}
-                st.markdown(pick_rebalance_text(_rb, _trk['days'] if _trk else None, _nmap))
+                st.markdown(pick_rebalance_text(_rb, _trk['days'] if _trk else None, _nmap, check_info((_meta or {}).get('date'), (_trk or {}).get('last') or max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=''))))
                 if (_rb['sell'] or _rb['buy']) and st.button(f"🔄 套用換股：賣 {len(_rb['sell'])} 檔、補 {len(_rb['buy'])} 檔 → 更新「我的清單4」（報酬監控從今天重新起算）", key='pick_rebal'):
                     ss['lists']['我的清單4'] = _rb['new']
                     save_custom_lists(ss['lists'])
