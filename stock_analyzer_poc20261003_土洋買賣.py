@@ -2703,7 +2703,7 @@ def inst3m_asof(daily, asof):
 # ════════════════════════════════════════════════════════════════════
 # ── 回測記憶體：每檔結果轉成「欄位→numpy 陣列」，最後逐欄合併（合併完一欄就釋放該欄），
 # 記憶體高峰約只有最終資料的 1 倍，不會像 pd.concat＋排序＋複製那樣疊到 3 倍 ──
-DEAD_BT_COLS = ('crossMa60_3', 'crossMa100_3', 'gcBelow0_3')   # 已確認無效、旗標已移除的欄位，不再存進回測紀錄
+DEAD_BT_COLS = ('crossMa60_3', 'crossMa100_3', 'gcBelow0_3', '_ckMeta')   # 已確認無效、旗標已移除的欄位，不再存進回測紀錄
 
 
 def frame_arrays(d):
@@ -2831,6 +2831,69 @@ def bt_csv_gz(df):
     return buf.getvalue()
 
 
+BT_CKPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bt_ckpt.csv.gz')   # 2026-11-14 回測每跑1/3自動存進度（伺服器端；App 沒重開時可還原）
+BT_CK_PARTS = 3
+
+
+def bt_ck_bytes(frames, meta):
+    """2026-11-14 回測進度檔：目前為止的原始紀錄（.csv.gz），第一列附 _ckMeta（段別、股票池、選項、已跑到第幾檔），上傳即可接續；
+    這個檔也能直接拿去「載入回測原始紀錄」分析（_ckMeta 欄會自動丟掉）"""
+    d = low_mem_concat(frames, sort=False)
+    if not len(d):
+        return None
+    d['_ckMeta'] = None
+    d.loc[0, '_ckMeta'] = json.dumps(meta, ensure_ascii=False)
+    out = bt_csv_gz(d)
+    del d
+    gc.collect()
+    return out
+
+
+def bt_ck_save(data, meta):
+    try:
+        with open(BT_CKPT_FILE, 'wb') as fh:
+            fh.write(data)
+        with open(BT_CKPT_FILE + '.meta', 'w', encoding='utf-8') as fh:
+            json.dump(dict(meta, time=dt.datetime.now().strftime('%m/%d %H:%M')), fh, ensure_ascii=False)
+    except Exception:  # noqa
+        pass
+
+
+def bt_ck_meta():
+    try:
+        with open(BT_CKPT_FILE + '.meta', 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:  # noqa
+        return None
+
+
+def bt_ck_clear():
+    for p in (BT_CKPT_FILE, BT_CKPT_FILE + '.meta'):
+        try:
+            os.remove(p)
+        except Exception:  # noqa
+            pass
+
+
+def bt_ck_load(f):
+    """讀回測進度檔 → (已完成的原始紀錄 DataFrame, meta)"""
+    if hasattr(f, 'seek'):
+        f.seek(0)
+    d = pd.read_csv(f, compression='gzip', dtype={'stockId': str}, low_memory=False)
+    meta = None
+    if '_ckMeta' in d.columns:
+        v = d['_ckMeta'].dropna()
+        meta = json.loads(v.iloc[0]) if len(v) else None
+        del d['_ckMeta']
+    if not meta:
+        raise ValueError('這個檔不是回測進度檔（沒有進度資訊）；完整的回測原始紀錄請用下方「載入」')
+    for c in d.columns:
+        if c not in ('evalDate', 'stockId', 'name') and (pd.api.types.is_float_dtype(d[c]) or pd.api.types.is_integer_dtype(d[c])):
+            d[c] = d[c].astype(np.float32)
+    d['evalDate'] = d['evalDate'].astype(str)
+    return d, meta
+
+
 def merge_dup_rows(df):
     """2026-11-08 同日同檔出現多次（分開勾選選項跑同一段，或段與段交界）→ 合併成一列：每個欄位取最後一個非空值。
     例如同一段先跑「財報品質＋三大法人」、再只勾「月營收」跑一次，兩個檔一起載入就會合併成完整欄位"""
@@ -2910,7 +2973,7 @@ def exit_feats(b, e):
 
 
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
-                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False, include_chip2=False, include_fq=False):
+                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60, include_pe=False, include_chip2=False, include_fq=False, start_at=0, prior=None, on_part=None, parts=BT_CK_PARTS):
     """FinMind 每小時額度用完時（HTTP 402）不會把剩下的股票全部記成失敗，而是暫停等待、額度恢復後從同一檔繼續；
     最多等 max_quota_wait 秒。前 40 檔全部因同一個原因失敗（Token 錯誤、連線不到）會提早停止。"""
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
@@ -2931,6 +2994,12 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     total = len(universe)
     stopped = None
     state = {'waited': 0.0}
+    start_at = int(start_at or 0)
+    if prior is not None and len(prior):   # 2026-11-14 接續中斷的回測：先放進已完成的紀錄
+        frames.append(frame_arrays(prior))
+        saved += len(prior)
+    ck_at = {-(-total * k // parts): k for k in range(1, parts)} if on_part and parts > 1 else {}   # 每跑 1/parts 存一次進度
+    done_n = start_at
 
     def prog(i, sid, note=None):
         if on_progress:
@@ -3075,6 +3144,8 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
         return d, None
 
     for i, sid in enumerate(universe):
+        if i < start_at:
+            continue
         if should_stop and should_stop():
             break
         prog(i, sid)
@@ -3095,6 +3166,12 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
         if i + 1 >= 40 and saved == 0 and failed >= i + 1 and len(fail_reasons) == 1:
             stopped = f'前 {i + 1} 檔全部失敗且原因相同，提早停止：{next(iter(fail_reasons))}'
             break
+        done_n = i + 1
+        if (i + 1) in ck_at:
+            try:
+                on_part(ck_at[i + 1], parts, i + 1, total, frames)
+            except Exception:  # noqa
+                pass
         if i < total - 1 and delay:
             time.sleep(delay)
     prog(total, None)
@@ -3108,7 +3185,8 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                          for k, v in chip_state.items() if include_chip2 and v['fail']) or None
     mk = locals().get('mkt_chip') or {}
     mkt_err = '、'.join(n_ for k, n_ in (('fut', '期貨外資未平倉'), ('tmg', '整體融資')) if not mk.get(k)) or None
-    return df, dict(saved=saved, failed=failed, total=total, top_fail=[f'{k}（{v}檔）' for k, v in top],
+    done_n = total if not stopped and not (should_stop and should_stop()) else done_n
+    return df, dict(saved=saved, failed=failed, total=total, top_fail=[f'{k}（{v}檔）' for k, v in top], done_n=done_n,
                     stopped=stopped, quota_wait_min=int(state['waited'] // 60), chip_err=chip_err,
                     mkt_err=(mkt_err + ' 抓不到，對應的大盤籌碼條件這次不會出現') if mkt_err else None)
 
@@ -6170,7 +6248,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-13 換股檢查日11／26'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-14 回測每1/3存進度＋接續'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6322,6 +6400,26 @@ def main():
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
         bt_delay = st.number_input('回測每檔間隔秒數', 0.0, 5.0, 0.3, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
+        # 2026-11-14 回測中斷接續：每跑完 1/3 自動存進度（伺服器＋提供下載），中斷後上傳進度檔從斷點接著跑
+        bt_rs = None
+        bt_resume = st.file_uploader('📂 接續中斷的回測：上傳「回測進度檔」（回測每跑完 1/3 會出現下載按鈕；段別、股票池、選項會照進度檔，不用重選）',
+                                     type=['gz'], key='bt_resume')
+        if bt_resume is not None and st.button('▶️ 從進度檔接續回測', use_container_width=True, key='bt_go_resume'):
+            bt_rs = 'upload'
+        _bm = bt_ck_meta() if os.path.exists(BT_CKPT_FILE) else None
+        if _bm:
+            st.caption(f"♻️ 伺服器上有未完成的回測進度（{_bm.get('time')}）：{_bm.get('seg')}・{_bm.get('univ')}，已跑 {_bm.get('done')}／{_bm.get('total')} 檔"
+                       '（App 重開後會消失，記得下載）')
+            _c1, _c2 = st.columns(2)
+            if _c1.button('♻️ 接續', use_container_width=True, key='bt_restore'):
+                bt_rs = 'server'
+            try:
+                with open(BT_CKPT_FILE, 'rb') as _fh:
+                    _c2.download_button('💾 下載', _fh.read(), file_name=f"回測進度_{_bm.get('label') or ''}_{_bm.get('done')}of{_bm.get('total')}.csv.gz",
+                                        mime='application/gzip', key='bt_ck_srv', on_click='ignore', use_container_width=True)
+            except Exception:  # noqa
+                pass
+        run_bt = run_bt or bool(bt_rs)
         ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如六段各一個；同一段分開勾選跑的檔也可一起載入，會自動合併欄位）',
                                type=['csv', 'gz'], accept_multiple_files=True)
         up_sig = tuple(sorted((u.name, u.size) for u in ups)) if ups else None
@@ -6457,12 +6555,54 @@ def main():
         if not token:
             st.error('請先輸入 FinMind API Token')
         else:
-            univ = {'上市清單': K['TWSE_LIST'], '上櫃清單': K['TPEX_LIST'],
-                    '上市+上櫃': K['TWSE_LIST'] + K['TPEX_LIST'],
-                    '目前輸入框清單': parse_stocks(ss['stocks_text'])}[bt_univ]
             # 先釋放上一段回測留在 session 的資料（原始紀錄、壓縮檔、分析快取），
             # 否則第2、3段跑的時候舊資料還佔著記憶體，Streamlit Cloud（約1GB）容易直接當掉
             release_bt_state(ss)
+            _prior, _st0, _rm = None, 0, None
+            if bt_rs:   # 2026-11-14 接續中斷的回測
+                try:
+                    if bt_rs == 'server':
+                        with open(BT_CKPT_FILE, 'rb') as _fh:
+                            _prior, _rm = bt_ck_load(io.BytesIO(_fh.read()))
+                    else:
+                        _prior, _rm = bt_ck_load(bt_resume)
+                    bt_univ, bt_months, bt_off = _rm['univ'], int(_rm['months']), int(_rm['off'])
+                    bt_seg = _rm['seg'] if _rm.get('seg') in BT_SEG_OPTIONS else BT_SEG_OPTIONS[0]
+                    _o = _rm.get('opts') or {}
+                    bt_div, bt_inst, bt_pe, bt_fq, bt_chip2 = (bool(_o.get(k_)) for k_ in ('div', 'inst', 'pe', 'fq', 'chip2'))
+                    bt_liq = _o.get('liq', bt_liq)
+                    _st0 = int(_rm['done'])
+                    st.info(f"📂 接續回測：{_rm.get('seg')}・{bt_univ}，已完成 {_st0:,}／{_rm.get('total')} 檔（{len(_prior):,} 筆），從第 {_st0 + 1} 檔繼續")
+                    if _rm.get('date') and _rm['date'] != str(dt.date.today()):
+                        st.caption(f"ℹ️ 進度檔是 {_rm['date']} 跑的，今天接續時評估區間會往後移幾天（影響很小；合併時重複的日期會自動去重）")
+                except Exception as _ex:  # noqa
+                    st.error(f'進度檔讀取失敗，改成從頭跑：{_ex}')
+                    _prior, _st0, _rm = None, 0, None
+            univ = {'上市清單': K['TWSE_LIST'], '上櫃清單': K['TPEX_LIST'],
+                    '上市+上櫃': K['TWSE_LIST'] + K['TPEX_LIST'],
+                    '目前輸入框清單': (_rm or {}).get('ids') or parse_stocks(ss['stocks_text'])}[bt_univ]
+            if _rm and int(_rm.get('total') or 0) != len(univ):
+                st.warning(f"⚠️ 股票池檔數和進度檔不同（進度檔 {_rm.get('total')} 檔，現在 {len(univ)} 檔），清單可能改過；仍從第 {_st0 + 1} 檔接續")
+            _seg_lab = '' if bt_seg == BT_SEG_OPTIONS[0] else (re.search(r'第\d+段', bt_seg) or [''])[0]
+            _meta0 = dict(v=1, seg=bt_seg, label=_seg_lab, months=int(bt_months), off=int(bt_off), univ=bt_univ,
+                          ids=list(univ) if bt_univ == '目前輸入框清單' else None, total=len(univ), date=str(dt.date.today()),
+                          opts=dict(div=bool(bt_div), inst=bool(bt_inst), pe=bool(bt_pe), fq=bool(bt_fq), chip2=bool(bt_chip2), liq=bt_liq))
+            _ckbox = st.empty()
+            _ckn = [0]
+            _utag = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff＋+]', '', str(bt_univ).replace('清單', ''))
+
+            def _bt_ck_dl(data, meta, txt):
+                _ckn[0] += 1
+                _ckbox.download_button(txt, data=data, mime='application/gzip', use_container_width=True, on_click='ignore',
+                                       file_name=f"回測進度_{_seg_lab or '自訂'}_{_utag}_{meta['done']}of{meta['total']}_{dt.date.today():%Y%m%d}.csv.gz",
+                                       key=f'bt_ck_{_ckn[0]}_{int(time.time())}')
+
+            def _on_part(k, parts, n, total, frames):
+                meta = dict(_meta0, done=n)
+                data = bt_ck_bytes(frames, meta)
+                if data:
+                    bt_ck_save(data, meta)
+                    _bt_ck_dl(data, meta, f'💾 下載回測進度檔（{k}/{parts} 完成：{n:,}／{total:,} 檔）— 中斷後在左側「📂 接續中斷的回測」上傳，從這裡接著跑')
             prog = st.progress(0.0, text='🔬 歷史回測執行中...')
             det = st.empty()
 
@@ -6472,8 +6612,19 @@ def main():
                 det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔'
                             + (f'\n\n{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_inst, bt_liq * 10000, vpp,
-                                   delay=bt_delay, on_progress=onp, end_offset_months=bt_off, include_pe=bt_pe, include_chip2=bt_chip2, include_fq=bt_fq)
-            ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else (re.search(r'第\d+段', bt_seg) or [''])[0]
+                                   delay=bt_delay, on_progress=onp, end_offset_months=bt_off, include_pe=bt_pe, include_chip2=bt_chip2, include_fq=bt_fq,
+                                   start_at=_st0, prior=_prior, on_part=_on_part)
+            del _prior
+            if stt.get('done_n', 0) >= stt.get('total', 0):
+                bt_ck_clear()   # 跑完了：伺服器上的進度不再需要
+                _ckbox.empty()
+            elif len(df):   # 中途停止（額度用完等）：存一份到停下來的地方，之後可接續
+                _m = dict(_meta0, done=int(stt.get('done_n') or 0))
+                _d = bt_ck_bytes([frame_arrays(df)], _m)
+                if _d:
+                    bt_ck_save(_d, _m)
+                    _bt_ck_dl(_d, _m, f"💾 下載回測進度檔（停在 {_m['done']:,}／{_m['total']:,} 檔）— 之後在左側「📂 接續中斷的回測」上傳接著跑")
+            ss['bt_seg_label'] = _seg_lab
             prog.empty()
             ss['bt_df'] = store_bt_df(df)
             ss['bt_ver'] = ss.get('bt_ver', 0) + 1
