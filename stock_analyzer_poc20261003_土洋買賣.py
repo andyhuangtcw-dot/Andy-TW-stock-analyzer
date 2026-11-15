@@ -5050,6 +5050,58 @@ def mark_star(main, k=STAR_N):
     return main, up
 
 
+HOT_MIN = 8    # 2026-11-15 🔥B方案：命中 S／W 組合數 ≥8 才買
+HOT_N = 5      # 最多 5 檔、每檔 20%，不足的部分放現金
+
+
+def hot_picks(df, k=HOT_N, th=HOT_MIN):
+    """2026-11-15 🔥B方案：本月建議清單（全部，不限前20）裡命中 S／W 組合數 ≥8 的股票，依命中數、60日波動低排序 → (前 k 檔, 全部命中≥8)。
+    上市 2017～2021 五年樣本外逐日回測（欄位完整，換股日錯開10種取中位數）：年化 40.8%、最大回撤 −23%、最差起始日 31%；
+    ⭐精選5 37.7%／−42%／18%；0050 約 18%／−30%。2018 空頭 +17%（精選5 −13%）；平均約一半時間持有現金，權值股獨強的年份（2017、2019上半）會落後"""
+    main = monthly_picks(df, 10 ** 6)[0] if df is not None else None
+    if main is None or not len(main) or 'S+W命中數' not in main.columns:
+        return None, None
+    h = pd.to_numeric(main['S+W命中數'], errors='coerce').fillna(0)
+    v = pd.to_numeric(main['_vol'], errors='coerce').fillna(1e9) if '_vol' in main.columns else 0
+    allh = main[h >= th].assign(_v=v).sort_values(['S+W命中數', '_v'], ascending=[False, True]).drop(columns=['_v'])
+    return allh.head(k), allh
+
+
+def pick_rebalance_hot(meta, hot_ids, analyzed, due, k=HOT_N):
+    """2026-11-15 🔥B方案換股：檢查日（每月11日、26日）→ 持股只留「命中≥8 前5檔」，其他賣掉，空位補前5檔裡還沒持有的；
+    非檢查日 → 不賣，只在有空位時補進新出現的命中≥8股票。每檔 20%，沒補滿的部分是現金"""
+    if not meta or meta.get('ids') is None:
+        return None
+    held = [str(x) for x in meta['ids']]
+    hot_ids = [str(x) for x in hot_ids]
+    tgt = set(hot_ids[:k])
+    if due:
+        keep = [s for s in held if s in tgt]
+        sell = [s for s in held if s not in tgt and s in analyzed]
+        unk = [s for s in held if s not in tgt and s not in analyzed]
+        pool = hot_ids[:k]
+    else:
+        keep, sell, unk, pool = held[:], [], [], hot_ids
+    buy = [s for s in pool if s not in held][:max(0, k - len(keep) - len(unk))]
+    new = keep + unk + buy
+    return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=new, cash=max(0, k - len(new)) * 100 // k, due=bool(due))
+
+
+def pick_rebalance_hot_text(rb, names, chk=None, half=False):
+    if not rb:
+        return None
+    nm = lambda L: '、'.join(f"{s} {names.get(s, '')}".strip() for s in L) or '無'
+    _nx = (chk or (None,))[0]
+    w = 10 if half else 20
+    hd = (f"**今天是檢查日（{_nx[5:]}）**：只留命中≥8前5檔、其他賣掉" if rb['due'] else
+          (f"非檢查日（下次 {_nx[5:]}）：不賣，有空位才補新的命中≥8股票" if _nx else '非檢查日：不賣，有空位才補新的命中≥8股票'))
+    return (f"🔄 🔥B方案換股檢查｜{hd}\n\n"
+            f"續抱 {len(rb['keep'])} 檔｜**該賣 {len(rb['sell'])} 檔**：{nm(rb['sell'])}｜**該買 {len(rb['buy'])} 檔**：{nm(rb['buy'])}"
+            + (f"｜⚠️ 這次沒分析到 {len(rb['unk'])} 檔（先續抱，請把它們一起跑）：{nm(rb['unk'])}" if rb['unk'] else '')
+            + f"\n\n換股後：{len(rb['new'])} 檔、每檔 {w}%｜**現金 {100 - len(rb['new']) * w}%**"
+            + ('（大盤跌破60日線：持股減半）' if half else ''))
+
+
 def monthly_picks(df, n=None):
     """2026-11-04 主力＝命中 S 或 W、排除價格弱勢（60日低波動≤25%／距52週低點≤10%／中期動能弱）與 S命中但P/E<12倍，依多方力道取前 n 檔；
     籌碼加持＝主力裡外資持股增加≥1%或融資增加≥20%。
@@ -6248,7 +6300,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-15 修正回測進度存檔後前段紀錄遺失'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-15 🔥B方案：命中≥8才買、不足放現金'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6673,8 +6725,8 @@ def render_batch(st, ss, K):
         (st.success if B and B.get('results') else st.error)(ss['full_msg'])
     if not B or not B['results']:
         st.info('在左側輸入 FinMind API Token 與股票代號，點擊「🔍 批次分析」即可開始。')
-        st.markdown('#### 📘 每月操作流程（2026-11-06 回測定案的做法）')
-        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **⚖️ 決定總持股**　看批次分析上方「📋 大盤指引」的建議持股％：加權指數收盤跌破60日線 → 持股減半，站回就恢復。資金等權重買 ⭐精選5（跌破60日線時同樣5檔各減半，不換成20檔）；想分散就買主力20檔。\n4. **⏳ 持有與換股（每月11日、26日檢查，遇假日順延）**　11日是月營收公布完後第一天。檢查日重跑一次：持股還在本月建議清單上（不必前20）就續抱，掉出清單的賣掉，用新名單裡排名最前、還沒持有的補足20檔（📍 組合報酬監控下方的「🔄 換股檢查」會直接列出，按「套用換股」更新清單4）。不要每天跟著新名單換（名單每天約變動25～30%，換股成本會吃掉報酬）。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
+        st.markdown('#### 📘 每月操作流程（2026-11-15 改用🔥B方案）')
+        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **🔥 買進（2026-11-15 改用B方案）**　「📦 本月建議組合」最上面的「🔥 建議持股」：只買命中 S／W 組合數 ≥8 的股票，最多5檔、每檔20%，不足的部分放現金（沒有符合的就全部現金）。按「📥 🔥建議持股存成我的清單4」開始監控。加權指數收盤跌破60日線 → 每檔減半為10%，站回就恢復。（上市 2017～2021 五年樣本外回測：年化 40.8%、最大回撤 −23%；⭐精選5 37.7%／−42%；0050 約 18%）\n4. **⏳ 補位與換股**　每天（至少每週幾次）跑全市場：有空位、又出現新的命中≥8股票就買進補位，**非檢查日不賣**。每月11日、26日（遇假日順延）是檢查日：只留命中≥8前5檔，其他賣掉。「🔄 🔥B方案換股檢查」會直接列出該賣、該買和現金比例，按「套用換股」更新清單4。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
         st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
@@ -6760,8 +6812,24 @@ def render_batch(st, ss, K):
             _a, _b = st.columns(2)
             _star = _pm[_pm['精選'] == '⭐']
             _b60m = pd.to_numeric(_pm['_b60'], errors='coerce').mean() if '_b60' in _pm.columns else float('nan')
+            # 2026-11-15 🔥B方案（命中≥8 才買，最多5檔、每檔20%，不足放現金）：上市五年樣本外回測最佳 → 列為主要建議
+            _hp, _ha = hot_picks(df)
+            _half = _b60m < 0.5
+            _w = 10 if _half else 20
+            st.markdown(f'#### 🔥 建議持股（B方案：命中 S／W 組合數 ≥{HOT_MIN} 才買，最多 {HOT_N} 檔、每檔 {_w}%，不足放現金）')
+            if _hp is not None and len(_hp):
+                st.markdown('、'.join(f"**{r['股票']} {r['名稱']}**（命中{int(r['S+W命中數'])}）" for _, r in _hp.iterrows())
+                            + f"　→ 股票 {len(_hp) * _w}%｜**現金 {100 - len(_hp) * _w}%**" + ('　（大盤跌破60日線：每檔減半為10%）' if _half else '')
+                            + (f"｜命中≥{HOT_MIN} 共 {len(_ha)} 檔，取前 {HOT_N}" if len(_ha) > HOT_N else ''))
+                st.dataframe(_hp[[c for c in _cols if c in _hp.columns]], hide_index=True, use_container_width=True)
+            else:
+                st.markdown(f'目前沒有命中≥{HOT_MIN} 的股票 → **全部持有現金**（B方案空頭時常常沒有股票符合，這就是它回撤小的原因）')
+            st.caption('上市 2017～2021 五年樣本外逐日回測（欄位完整，換股日錯開10種取中位數）：🔥B方案 年化 40.8%、最大回撤 −23%、最差起始日 31%；'
+                       '⭐精選5 37.7%／−42%／18%；0050 約 18%／−30%。2018 空頭 +17%（精選5 −13%），平均約一半時間是現金；'
+                       '權值股獨強的年份（2017、2019上半）會落後 0050。操作：每天跑分析，有空位就補新的命中≥8股票；每月11日、26日只留命中≥8前5檔；'
+                       '大盤跌破60日線持股減半。上櫃尚未驗證。')
             _a.markdown('**🚀 主力組合**（S 或 W，排除價格弱勢；上市另排除三大法人近3月賣超）'
-                        + (('　⭐精選5：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _star.iterrows())
+                        + (('　⭐精選5（舊規則，參考）：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _star.iterrows())
                             + ('　（大盤跌破60日線：這5檔各減半持有）' if _b60m < 0.5 else '')) if len(_star) else ''))
             _a.caption('⚠️高回撤＝命中 W14／S6／W17（強勢突破盤＋地量＋短線過熱／創52週新高／近3日漲停）：20日內平均最大回撤約 −15%（全體 −8.7%），但報酬也最高（+9～11%），買了要能忍震盪，不必排除')
             _a.caption('⭐精選5＝主力20檔裡命中 S／W 組合數最多的5檔（同數選60日波動低）；大盤跌破60日線時同樣這5檔、只把持股減半（不換成20檔）。「建議權重(命中)」依命中組合數分配（回測年化 上市 +2.5、上櫃 +15 個百分點，回撤不變）；「命中×低波動」報酬略低但回撤最小，單檔上限35%。回測（台股上市＋上櫃5年逐日）：5檔＋跌破減半 年化約 49%（20檔約 40%），最大回撤 −35%（20檔 −33%）')
@@ -6780,17 +6848,24 @@ def render_batch(st, ss, K):
             # 2026-11-08 兩週換股檢查：還在清單就續抱、掉出清單才賣
             _elig = [str(x) for x in monthly_picks(df, 10 ** 6)[0]['股票']]
             _anz = {str(r['stockId']) for r in results} | {str(p['stockId']) for p in (B.get('pool') or [])}
-            _rb = pick_rebalance(_meta, _elig, _anz)
+            _ck = check_info((_meta or {}).get('date'), (_trk or {}).get('last') or max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=''))
+            _rb = pick_rebalance_hot(_meta, list(_ha['股票']) if _ha is not None else [], _anz, bool(_ck and _ck[1]))   # 2026-11-15 改用 🔥B方案換股
             if _rb:
                 _nmap = {str(r['stockId']): r.get('name', '') for r in results}
-                st.markdown(pick_rebalance_text(_rb, _trk['days'] if _trk else None, _nmap, check_info((_meta or {}).get('date'), (_trk or {}).get('last') or max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=''))))
-                if (_rb['sell'] or _rb['buy']) and st.button(f"🔄 套用換股：賣 {len(_rb['sell'])} 檔、補 {len(_rb['buy'])} 檔 → 更新「我的清單4」（報酬監控從今天重新起算）", key='pick_rebal'):
+                st.markdown(pick_rebalance_hot_text(_rb, _nmap, _ck, _half))
+                if (_rb['sell'] or _rb['buy']) and st.button(f"🔄 套用換股：賣 {len(_rb['sell'])} 檔、買 {len(_rb['buy'])} 檔 → 更新「我的清單4」（報酬監控從今天重新起算）", key='pick_rebal'):
                     ss['lists']['我的清單4'] = _rb['new']
                     save_custom_lists(ss['lists'])
                     _d0 = max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=str(dt.date.today()))
                     save_pick_meta(dict(date=_d0, ids=_rb['new']))
                     st.success(f"✅ 已更新「我的清單4」（{len(_rb['new'])} 檔），以 {_d0} 收盤重新起算報酬")
-            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（覆蓋，並從今天開始監控組合報酬）', key='pick_to_list4', disabled=not len(_pm)):
+            if _hp is not None and len(_hp) and st.button(f'📥 🔥建議持股 {len(_hp)} 檔存成「我的清單4」（覆蓋，並從今天開始監控組合報酬、做B方案換股檢查）', key='hot_to_list4'):
+                ss['lists']['我的清單4'] = [str(x) for x in _hp['股票']]
+                save_custom_lists(ss['lists'])
+                _d0 = max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=_ds(dt.date.today()))
+                save_pick_meta(dict(date=_d0, ids=[str(x) for x in _hp['股票']]))
+                st.success(f'✅ 已存成「我的清單4」（{len(_hp)} 檔），以 {_d0} 收盤為進場價開始監控')
+            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（舊規則；覆蓋，並從今天開始監控組合報酬）', key='pick_to_list4', disabled=not len(_pm)):
                 ss['lists']['我的清單4'] = [str(x) for x in _pm['股票']]
                 save_custom_lists(ss['lists'])
                 _d0 = max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=_ds(dt.date.today()))
