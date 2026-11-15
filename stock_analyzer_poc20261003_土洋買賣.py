@@ -2838,7 +2838,7 @@ BT_CK_PARTS = 3
 def bt_ck_bytes(frames, meta):
     """2026-11-14 回測進度檔：目前為止的原始紀錄（.csv.gz），第一列附 _ckMeta（段別、股票池、選項、已跑到第幾檔），上傳即可接續；
     這個檔也能直接拿去「載入回測原始紀錄」分析（_ckMeta 欄會自動丟掉）"""
-    d = low_mem_concat(frames, sort=False)
+    d = low_mem_concat([dict(f) for f in frames], sort=False)   # 2026-11-15 修正：low_mem_concat 會清空傳入的 frames，要給複本，否則存完進度後前面的紀錄會從最終結果消失
     if not len(d):
         return None
     d['_ckMeta'] = None
@@ -6248,7 +6248,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-14 回測每1/3存進度＋接續'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-15 修正回測進度存檔後前段紀錄遺失'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
