@@ -5010,6 +5010,18 @@ def top30_hits(row):
     return out
 
 
+F277_COMBO = ['爆量(≥2倍均量)', '距52週高點≤5%', '短線過熱(高於月線≥20%)']   # 2026-11-15 💥F277 飆股起漲訊號
+
+
+def f277_hit(row):
+    """2026-11-15 💥F277（爆量≥2倍＋距52週高點≤5%＋短線過熱）：上市10年每年十大飆股起漲時命中 29%（全體 7%，4.2倍），10年每年都出現；
+    當成 B 方案補空位的規則回測：樣本外年化 42→51% 但回撤 −23→−29%、近5年反而較差 → 只標示、不寫進規則"""
+    try:
+        return bool(matched_combos(row, [F277_COMBO]))
+    except Exception:  # noqa
+        return False
+
+
 def top30_tags(row):
     h = top30_hits(row)
     return ''.join(f" {e}{n}{len(h[k]) if len(h[k]) > 1 else ''}" for k, e, n, _ in TOP30_LABELS if k in h)
@@ -5051,10 +5063,42 @@ def mark_star(main, k=STAR_N):
 
 
 HOT_MIN = 8    # 2026-11-15 🔥B方案：命中 S／W 組合數 ≥8 才買
-HOT_N = 5      # 最多 5 檔、每檔 20%，不足的部分放現金
+HOT_N = 5      # 最多 5 檔
+HOT_CAP = 34   # 2026-11-15 單檔上限 34%：命中≥8 的股票平分資金（1檔34%、2檔各34%、3檔各33%、4檔各25%、5檔各20%），剩下放現金
+#   上市10年逐日回測（換股日錯開10種取中位數）：樣本外 2017～2021 年化 41.9→50.1%、回撤 −23→−31%；10年 54.5→67.2%／−24→−31%
+#   全部集中（1檔就100%）80%／−40% 個股風險太大；閒置資金季線上買0050 反而較差（樣本外 34.5%）
 
 
-def hot_picks(df, k=HOT_N, th=HOT_MIN):
+def hot_weight(n, half=False):
+    """命中≥8 有 n 檔時每檔建議％（大盤跌破60日線再減半）"""
+    if n <= 0:
+        return 0
+    w = min(100 / n, HOT_CAP)
+    return round(w / 2 if half else w, 1)
+
+
+def eps_loss_ids(ids, token, cache):
+    """2026-11-16 B方案排除：最新已公布一季 EPS<0 的股票（季報，每檔 1 次 API；結果存在 session，同一天不重抓）。
+    10年回測（上市＋上櫃、單檔上限34%）：B方案選出的股票裡 4.4% 屬於最新季虧損，後20日平均 −0.7%（其他 +7.3%）、1/4 會跌超過15%；
+    排除後 10年年化 114.0→117.7%、回撤 −30.4→−29.5%，樣本外（2017～21）84.1→87.5%、樣本內 151.8→153.6%，兩段都改善"""
+    out = set()
+    if not token:
+        return out
+    today = _ds(dt.date.today())
+    for sid in ids:
+        key = (str(sid), today)
+        if key not in cache:
+            try:
+                f = fin_feats_asof(fetch_fin_hist(str(sid), token, 500), _ds(dt.date.today() + dt.timedelta(days=1)))
+                cache[key] = f.get('epsLoss')
+            except Exception:  # noqa
+                cache[key] = None
+        if cache[key] == 1:
+            out.add(str(sid))
+    return out
+
+
+def hot_picks(df, k=HOT_N, th=HOT_MIN, excl=None):
     """2026-11-15 🔥B方案：本月建議清單（全部，不限前20）裡命中 S／W 組合數 ≥8 的股票，依命中數、60日波動低排序 → (前 k 檔, 全部命中≥8)。
     上市 2017～2021 五年樣本外逐日回測（欄位完整，換股日錯開10種取中位數）：年化 40.8%、最大回撤 −23%、最差起始日 31%；
     ⭐精選5 37.7%／−42%／18%；0050 約 18%／−30%。2018 空頭 +17%（精選5 −13%）；平均約一半時間持有現金，權值股獨強的年份（2017、2019上半）會落後"""
@@ -5064,6 +5108,8 @@ def hot_picks(df, k=HOT_N, th=HOT_MIN):
     h = pd.to_numeric(main['S+W命中數'], errors='coerce').fillna(0)
     v = pd.to_numeric(main['_vol'], errors='coerce').fillna(1e9) if '_vol' in main.columns else 0
     allh = main[h >= th].assign(_v=v).sort_values(['S+W命中數', '_v'], ascending=[False, True]).drop(columns=['_v'])
+    if excl:
+        allh = allh[~allh['股票'].astype(str).isin(set(map(str, excl)))]
     return allh.head(k), allh
 
 
@@ -5084,7 +5130,7 @@ def pick_rebalance_hot(meta, hot_ids, analyzed, due, k=HOT_N):
         keep, sell, unk, pool = held[:], [], [], hot_ids
     buy = [s for s in pool if s not in held][:max(0, k - len(keep) - len(unk))]
     new = keep + unk + buy
-    return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=new, cash=max(0, k - len(new)) * 100 // k, due=bool(due))
+    return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=new, due=bool(due))
 
 
 def pick_rebalance_hot_text(rb, names, chk=None, half=False):
@@ -5092,14 +5138,14 @@ def pick_rebalance_hot_text(rb, names, chk=None, half=False):
         return None
     nm = lambda L: '、'.join(f"{s} {names.get(s, '')}".strip() for s in L) or '無'
     _nx = (chk or (None,))[0]
-    w = 10 if half else 20
+    w = hot_weight(len(rb['new']), half)
     hd = (f"**今天是檢查日（{_nx[5:]}）**：只留命中≥8前5檔、其他賣掉" if rb['due'] else
           (f"非檢查日（下次 {_nx[5:]}）：不賣，有空位才補新的命中≥8股票" if _nx else '非檢查日：不賣，有空位才補新的命中≥8股票'))
     return (f"🔄 🔥B方案換股檢查｜{hd}\n\n"
             f"續抱 {len(rb['keep'])} 檔｜**該賣 {len(rb['sell'])} 檔**：{nm(rb['sell'])}｜**該買 {len(rb['buy'])} 檔**：{nm(rb['buy'])}"
             + (f"｜⚠️ 這次沒分析到 {len(rb['unk'])} 檔（先續抱，請把它們一起跑）：{nm(rb['unk'])}" if rb['unk'] else '')
-            + f"\n\n換股後：{len(rb['new'])} 檔、每檔 {w}%｜**現金 {100 - len(rb['new']) * w}%**"
-            + ('（大盤跌破60日線：持股減半）' if half else ''))
+            + f"\n\n換股後：{len(rb['new'])} 檔、**每檔 {w:g}%**（檔數變了就把每檔調成這個比例）｜**現金 {100 - len(rb['new']) * w:.0f}%**"
+            + ('（大盤跌破60日線：持股減半）' if half else '') + f"\n\n權重：命中≥8 的股票平分資金、單檔上限 {HOT_CAP}%（1檔34%、2檔各34%、3檔各33%、4檔各25%、5檔各20%）")
 
 
 def monthly_picks(df, n=None):
@@ -5148,7 +5194,7 @@ def summary_frame(results, extras_flags, K, live=None):
         mm = matched_combos(r['row'], K['MOONSHOT_COMBOS'])
         ms = matched_combos(r['row'], K['STOCK_PICK_COMBOS'])
         rec = {
-            '類股': r.get('industry') or '', '股票': r['stockId'], '名稱': r['name'] + top30_tags(r['row']) + (' 🔴即時' if r.get('realtime') else ''),
+            '類股': r.get('industry') or '', '股票': r['stockId'], '名稱': r['name'] + (' 💥F277' if f277_hit(r['row']) else '') + top30_tags(r['row']) + (' 🔴即時' if r.get('realtime') else ''),
             '多方力道': r['total'], '評等': score_label(r['total']),
             '+DI': dm['plusDI'], '-DI': dm['minusDI'], 'ADX': dm['adx'], 'ADXR': dm['adxr'],
             '布林位置%': sig['bbPos'], '布林寬度%': bbw,
@@ -6300,7 +6346,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-15 🔥B方案：命中≥8才買、不足放現金'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-16 B方案排除最新季虧損'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6726,7 +6772,7 @@ def render_batch(st, ss, K):
     if not B or not B['results']:
         st.info('在左側輸入 FinMind API Token 與股票代號，點擊「🔍 批次分析」即可開始。')
         st.markdown('#### 📘 每月操作流程（2026-11-15 改用🔥B方案）')
-        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **🔥 買進（2026-11-15 改用B方案）**　「📦 本月建議組合」最上面的「🔥 建議持股」：只買命中 S／W 組合數 ≥8 的股票，最多5檔、每檔20%，不足的部分放現金（沒有符合的就全部現金）。按「📥 🔥建議持股存成我的清單4」開始監控。加權指數收盤跌破60日線 → 每檔減半為10%，站回就恢復。（上市 2017～2021 五年樣本外回測：年化 40.8%、最大回撤 −23%；⭐精選5 37.7%／−42%；0050 約 18%）\n4. **⏳ 補位與換股**　每天（至少每週幾次）跑全市場：有空位、又出現新的命中≥8股票就買進補位，**非檢查日不賣**。每月11日、26日（遇假日順延）是檢查日：只留命中≥8前5檔，其他賣掉。「🔄 🔥B方案換股檢查」會直接列出該賣、該買和現金比例，按「套用換股」更新清單4。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
+        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **🔥 買進（2026-11-15 改用B方案）**　「📦 本月建議組合」最上面的「🔥 建議持股」：只買命中 S／W 組合數 ≥8 的股票（排除最新一季虧損），最多5檔，平分資金、單檔上限34%（1檔34%、2檔各34%、3檔各33%、4檔25%、5檔20%），剩下放現金（沒有符合的就全部現金）。按「📥 🔥建議持股存成我的清單4」開始監控。加權指數收盤跌破60日線 → 持股減半，站回就恢復。（上市10年回測，樣本外 2017～2021：年化 50.1%、最大回撤 −31%；⭐精選5 37.7%／−42%；0050 約 18%）\n4. **⏳ 補位與換股**　每天（至少每週幾次）跑全市場：有空位、又出現新的命中≥8股票就買進補位，並把每檔調成新的平分比例，**非檢查日不賣**。每月11日、26日（遇假日順延）是檢查日：只留命中≥8前5檔，其他賣掉。「🔄 🔥B方案換股檢查」會直接列出該賣、該買和現金比例，按「套用換股」更新清單4。不設個股停損（回測停損反而虧更多）；回撤風險靠調整總持股控制。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
         st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
@@ -6814,20 +6860,34 @@ def render_batch(st, ss, K):
             _b60m = pd.to_numeric(_pm['_b60'], errors='coerce').mean() if '_b60' in _pm.columns else float('nan')
             # 2026-11-15 🔥B方案（命中≥8 才買，最多5檔、每檔20%，不足放現金）：上市五年樣本外回測最佳 → 列為主要建議
             _hp, _ha = hot_picks(df)
+            _epsx = set()
+            if _ha is not None and len(_ha):   # 2026-11-16 排除最新季虧損（只查命中≥8 的前 12 檔，API 次數很少）
+                _epsx = eps_loss_ids(list(_ha['股票'].astype(str))[:12], ss.get('token', '').strip(), ss.setdefault('_epsloss', {}))
+                if _epsx:
+                    _hp, _ha = hot_picks(df, excl=_epsx)
             _half = _b60m < 0.5
-            _w = 10 if _half else 20
-            st.markdown(f'#### 🔥 建議持股（B方案：命中 S／W 組合數 ≥{HOT_MIN} 才買，最多 {HOT_N} 檔、每檔 {_w}%，不足放現金）')
+            _w = hot_weight(len(_hp) if _hp is not None else 0, _half)
+            st.markdown(f'#### 🔥 建議持股（B方案：命中 S／W 組合數 ≥{HOT_MIN} 才買，最多 {HOT_N} 檔、平分資金、單檔上限 {HOT_CAP}%，不足放現金）')
             if _hp is not None and len(_hp):
                 st.markdown('、'.join(f"**{r['股票']} {r['名稱']}**（命中{int(r['S+W命中數'])}）" for _, r in _hp.iterrows())
-                            + f"　→ 股票 {len(_hp) * _w}%｜**現金 {100 - len(_hp) * _w}%**" + ('　（大盤跌破60日線：每檔減半為10%）' if _half else '')
+                            + f"　→ **每檔 {_w:g}%**，股票 {len(_hp) * _w:.0f}%｜**現金 {100 - len(_hp) * _w:.0f}%**" + ('　（大盤跌破60日線：已減半）' if _half else '')
                             + (f"｜命中≥{HOT_MIN} 共 {len(_ha)} 檔，取前 {HOT_N}" if len(_ha) > HOT_N else ''))
                 st.dataframe(_hp[[c for c in _cols if c in _hp.columns]], hide_index=True, use_container_width=True)
             else:
                 st.markdown(f'目前沒有命中≥{HOT_MIN} 的股票 → **全部持有現金**（B方案空頭時常常沒有股票符合，這就是它回撤小的原因）')
-            st.caption('上市 2017～2021 五年樣本外逐日回測（欄位完整，換股日錯開10種取中位數）：🔥B方案 年化 40.8%、最大回撤 −23%、最差起始日 31%；'
-                       '⭐精選5 37.7%／−42%／18%；0050 約 18%／−30%。2018 空頭 +17%（精選5 −13%），平均約一半時間是現金；'
+            if _epsx:
+                st.caption('⛔ 已排除最新一季虧損（EPS<0）：' + '、'.join(sorted(_epsx)) + '（10年回測：這類股票後20日平均 −0.7%，排除後年化 114→118%、回撤略小）')
+            st.caption(f'權重：命中≥8 的股票平分資金、單檔上限 {HOT_CAP}%（1檔34%、2檔各34%、3檔各33%、4檔各25%、5檔各20%）。'
+                       '上市10年逐日回測（換股日錯開10種取中位數）：樣本外 2017～2021 年化 50.1%、回撤 −31%（每檔固定20% 41.9%／−23%；全部集中 61.8%／−40%）；'
+                       '⭐精選5 37.7%／−42%；0050 約 18%／−30%。2018、2022 空頭都是正報酬；平均約 1/3 時間是現金；'
                        '權值股獨強的年份（2017、2019上半）會落後 0050。操作：每天跑分析，有空位就補新的命中≥8股票；每月11日、26日只留命中≥8前5檔；'
                        '大盤跌破60日線持股減半。上櫃尚未驗證。')
+            _f277 = [r for r in results if r.get('row') is not None and f277_hit(r['row'])]
+            st.markdown('**💥 F277 飆股起漲訊號**（爆量≥2倍＋距52週高點≤5%＋短線過熱；這次分析的全部股票）：'
+                        + ('、'.join(f"{r['stockId']} {r.get('name', '')}" for r in sorted(_f277, key=lambda r: -(r.get('total') or 0))) if _f277 else '目前沒有股票命中'))
+            st.caption('上市10年（2017～2026）每年十大飆股，起漲時有 29% 命中 F277（全體股票只有 7%，4.2倍，10年每年都出現），是最像飆股起漲的組合。'
+                       '但每天也有很多命中後不會漲的股票：當成 B 方案補空位的規則回測，樣本外年化 42→51%、回撤卻從 −23% 加深到 −29%，近5年反而較差 → 只標示參考、不寫進規則。'
+                       '名稱欄也會標 💥F277。全市場分批自動跑只保留候選股，這裡只會列出有進候選的股票')
             _a.markdown('**🚀 主力組合**（S 或 W，排除價格弱勢；上市另排除三大法人近3月賣超）'
                         + (('　⭐精選5（舊規則，參考）：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _star.iterrows())
                             + ('　（大盤跌破60日線：這5檔各減半持有）' if _b60m < 0.5 else '')) if len(_star) else ''))
