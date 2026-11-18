@@ -1226,7 +1226,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     ex = extras or {}
     row['divTotal'] = ex.get('divTotal')
     row['priceYoy3m'] = ex.get('priceYoy3m')
-    for k in ('revYoyTurn', 'revYoy3Pos', 'revHigh24'):
+    for k in ('revYoyTurn', 'revYoy3Pos', 'revHigh24') + REV_RAW_KEYS:
         row[k] = ex.get(k)
     row['inst3m'] = ex.get('inst3m')
     row['pe'] = ex.get('pe')
@@ -2621,7 +2621,7 @@ def last_n_known_months(asof, n):
     d = dt.date.fromisoformat(asof)
     y, m = d.year, d.month
     out = []
-    for _ in range(18):
+    for _ in range(n + 14):
         if revenue_known_by(y, m, asof):
             out.append((y, m))
             if len(out) >= n:
@@ -2655,6 +2655,55 @@ def rev_feats(rev, asof):
         prev = [p for p in prev if p is not None]
         if len(prev) >= 18:
             out['revHigh24'] = int(cur > max(prev))
+    out.update(rev_raw_feats(rev, asof))
+    return out
+
+
+REV_RAW_KEYS = ('revYoY', 'revMoM', 'revYoyN', 'revMomN', 'revTo24', 'revMomAdj', 'revYoyAcc')
+
+
+def rev_raw_feats(rev, asof):
+    """2026-11-18 回測研究用（先只存進回測紀錄，不當篩選條件）：營收創24月新高能否由連續 MoM／YoY 成長預先判讀。
+    revYoY／revMoM＝最新已公告月 YoY％／MoM％；revYoyN／revMomN＝YoY／MoM 連續為正的月數（往回最多24個月）；
+    revTo24＝最新月營收÷前23個月最高×100（≥100 即創新高）；revMomAdj＝MoM 減去去年同月 MoM（去季節性）；revYoyAcc＝YoY 較上月變化（百分點）"""
+    out = {k: None for k in REV_RAW_KEYS}
+    months = last_n_known_months(asof, 25)
+    if not rev or not months:
+        return out
+    g = lambda ym: rev.get(ym)
+    def yoy(y, m):
+        a, b = g((y, m)), g((y - 1, m))
+        return (a - b) / b * 100 if (a is not None and b) else None
+    def mom(y, m):
+        a, b = g((y, m)), g(_add_months(y, m, -1))
+        return (a - b) / b * 100 if (a is not None and b) else None
+    ly, lm = months[-1]
+    r = lambda v: None if v is None else round(v, 2)
+    out['revYoY'] = r(yoy(ly, lm)); out['revMoM'] = r(mom(ly, lm))
+    py_ = yoy(*months[-2]) if len(months) >= 2 else None
+    if out['revYoY'] is not None and py_ is not None:
+        out['revYoyAcc'] = r(out['revYoY'] - py_)
+    ml = mom(ly - 1, lm)
+    if out['revMoM'] is not None and ml is not None:
+        out['revMomAdj'] = r(out['revMoM'] - ml)
+    for key, fn in (('revYoyN', yoy), ('revMomN', mom)):
+        n_ = 0; started = False
+        for y, m in reversed(months[-24:]):
+            v = fn(y, m)
+            if v is None:
+                break
+            started = True
+            if v > 0:
+                n_ += 1
+            else:
+                break
+        out[key] = n_ if started else None
+    cur = g((ly, lm))
+    if cur is not None:
+        prev = [g(_add_months(ly, lm, -k)) for k in range(1, 24)]
+        prev = [x for x in prev if x is not None]
+        if len(prev) >= 18 and max(prev) > 0:
+            out['revTo24'] = r(cur / max(prev) * 100)
     return out
 
 
@@ -2980,7 +3029,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
     buf = 60
     maxh = max(HORIZONS)
     price_days = (months_back + off) * 30 + buf + maxh + 10 + 400   # +400天：52週高點、布林收窄需要約一年歷史（營收乖離也夠用）
-    rev_days = (months_back + off) * 30 + 800   # 營收創24個月新高需要多兩年的月營收
+    rev_days = (months_back + off) * 30 + 1200   # 營收創24個月新高＋YoY連續月數（2026-11-18）需要多三年多的月營收
     inst_days = (months_back + off) * 30 + 100
     pe_days = (months_back + off) * 30 + 1095 + 20   # 本益比百分位要往前看3年
     chip_days = (months_back + off) * 30 + 400           # 進階籌碼：20日變化、一年新高
@@ -6357,7 +6406,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-18 命中數去重(量能低檔＋近高點只算1)'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-18 回測加存月營收MoM／YoY原始值'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
