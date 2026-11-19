@@ -1233,7 +1233,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     row['pePct'] = ex.get('pePct')
     for k in CHIP2_KEYS:
         row[k] = ex.get(k)
-    for k in FQ_KEYS + MKT_DD_KEYS:
+    for k in FQ_KEYS + CF_KEYS + PEG_KEYS + MKT_DD_KEYS:
         row[k] = ex.get(k)
     row['trust5'] = ex.get('trust5')
     row['foreign5'] = ex.get('foreign5')
@@ -2086,6 +2086,41 @@ def val_asof(vh, ds):
     return out
 
 
+# ── 2026-11-19 回測加存 PEG（先只存進回測紀錄，待驗證）──
+#    近4季 EPS＝當天收盤價÷P/E（TWSE 本益比就是用近4季 EPS 算的，免去拆 Q4 累計數的問題）；
+#    epsTtmYoY＝近4季 EPS 對一年前（評估日往前365天內最近一筆）的成長%（一年前 EPS>0 才算）；
+#    peg＝P/E÷epsTtmYoY；pegQ＝P/E÷最新一季 EPS 年增%（財報品質那組的 epsYoY）；成長≤0 或 P/E 缺 → 空白
+PEG_KEYS = ('epsTtmYoY', 'peg', 'pegQ')
+
+
+def peg_asof(vh, ds, cmap, eps_yoy=None):
+    out = dict.fromkeys(PEG_KEYS)
+    if not vh:
+        return out
+    d, pe = vh[0], vh[1]
+    if not d:
+        return out
+    i = bisect.bisect_right(d, ds) - 1
+    if i < 0 or (dt.date.fromisoformat(ds) - dt.date.fromisoformat(d[i])).days > 10:
+        return out
+    p0 = float(pe[i]); c0 = cmap.get(d[i])
+    if not (p0 > 0):
+        return out
+    if c0:
+        j = bisect.bisect_right(d, _ds(dt.date.fromisoformat(d[i]) - dt.timedelta(days=365))) - 1
+        if j >= 0 and (dt.date.fromisoformat(d[i]) - dt.date.fromisoformat(d[j])).days <= 375:
+            p1 = float(pe[j]); c1 = cmap.get(d[j])
+            if p1 > 0 and c1:
+                e0, e1 = c0 / p0, c1 / p1
+                g = (e0 / e1 - 1) * 100
+                out['epsTtmYoY'] = round(g, 2)
+                if g > 0:
+                    out['peg'] = round(p0 / g, 3)
+    if eps_yoy is not None and eps_yoy > 0:
+        out['pegQ'] = round(p0 / eps_yoy, 3)
+    return out
+
+
 # ── 2026-11-04 台股新增：財報品質（TaiwanStockFinancialStatements 綜合損益表，每檔多1次API；待回測驗證）──
 #    比照美股「營運雙優」：台股沒有分析師預估，用「EPS年增」代替「EPS優於預期」。
 #    point-in-time：只用法定公布期限之後的季報（Q1→5/15、Q2→8/14、Q3→11/14、Q4（年報）→隔年3/31），不偷看未來。
@@ -2189,6 +2224,86 @@ def fin_feats_asof(fh, ds):
                 u0, u1 = eps_up(L), eps_up(L - 1)
                 if u0 is not None and u1 is not None:
                     out['epsUp2'] = int(u0 and u1)
+    return out
+
+
+# ── 2026-11-19 台股新增：現金流量（TaiwanStockCashFlowsStatement，跟「財報品質」同一個勾選，每檔多1次API；先只存進回測紀錄，待驗證）──
+#    台股現金流量表是「年初累計數」（Q2＝上半年），先拆成單季：本季累計−上季累計（Q1 直接用）。
+#    point-in-time：一樣只用法定公布期限之後的季報（_fq_avail）。金額單位：億元。
+#    cfoQ＝最新單季營業現金流；cfoTTM／fcfTTM＝近4季營業現金流／自由現金流（營業現金流−購置不動產廠房設備）；
+#    cfoNeg＝最新單季營業現金流<0；cfoNeg2＝連2季<0；cfoTTMNeg／fcfTTMNeg＝近4季合計<0
+CF_KEYS = ('cfoQ', 'cfoTTM', 'fcfTTM', 'cfoNeg', 'cfoNeg2', 'cfoTTMNeg', 'fcfTTMNeg')
+_CF_TYPES = {
+    'cfo': (('CashFlowsFromOperatingActivities', 'NetCashInflowFromOperatingActivities', 'NetCashFlowsFromUsedInOperatingActivities'),
+            ('營業活動之淨現金流入（流出）', '營業活動之淨現金流入(流出)', '營業活動之淨現金流入', '營業活動之淨現金流出')),
+    'capex': (('PropertyAndPlantAndEquipment', 'AcquisitionOfPropertyPlantAndEquipment'),
+              ('取得不動產、廠房及設備', '購置不動產、廠房及設備')),
+}
+
+
+def fetch_cf_hist(sid, token, days_back):
+    """回測用：現金流量表 → [(季底日, 可用日, {cfo, capex}), ...]（單季值，由舊到新）"""
+    end = dt.date.today()
+    j = api_get(dict(dataset='TaiwanStockCashFlowsStatement', data_id=sid,
+                     start_date=_ds(end - dt.timedelta(days=days_back)), end_date=_ds(end)), token)
+    Q = {}
+    for r in j.get('data') or []:
+        qd = str(r.get('date', ''))[:10]
+        v = _fnum(r.get('value'))
+        if len(qd) < 10 or v is None or qd[5:7] not in ('03', '06', '09', '12'):
+            continue
+        t, on = str(r.get('type') or ''), str(r.get('origin_name') or '').strip()
+        q = Q.setdefault(qd, {})
+        for k, (ts, ons) in _CF_TYPES.items():
+            if t in ts:
+                q[k] = v
+            elif k not in q and ('_' + k) not in q and (on in ons or any(on.startswith(x) for x in ons)):
+                q['_' + k] = v
+    ytd = {}
+    for qd, q in Q.items():
+        ytd[qd] = {k: (q[k] if k in q else q.get('_' + k)) for k in _CF_TYPES}
+    out = []
+    for qd in sorted(ytd):
+        y, m = qd[:4], qd[5:7]
+        cur = ytd[qd]
+        if m == '03':
+            single = dict(cur)
+        else:
+            pm = {'06': '03', '09': '06', '12': '09'}[m]
+            prv = ytd.get(f'{y}-{pm}-{"31" if pm in ("03",) else "30"}')
+            if prv is None:
+                prv = next((v for k2, v in ytd.items() if k2[:7] == f'{y}-{pm}'), None)
+            single = {k: (cur[k] - prv[k] if (prv is not None and cur.get(k) is not None and prv.get(k) is not None) else None) for k in _CF_TYPES}
+        out.append((qd, _fq_avail(qd), single))
+    return out
+
+
+def cf_feats_asof(ch, ds):
+    out = dict.fromkeys(CF_KEYS)
+    if not ch:
+        return out
+    av = [x for x in ch if x[1] < ds]
+    if not av:
+        return out
+    qd = av[-1][0]
+    if (dt.date.fromisoformat(ds[:10]) - dt.date.fromisoformat(qd)).days > 200:
+        return out
+    r2 = lambda v: None if v is None else round(v / 1e8, 3)
+    c0 = av[-1][2].get('cfo')
+    out['cfoQ'] = r2(c0)
+    if c0 is not None:
+        out['cfoNeg'] = int(c0 < 0)
+        if len(av) >= 2 and av[-2][2].get('cfo') is not None:
+            out['cfoNeg2'] = int(c0 < 0 and av[-2][2]['cfo'] < 0)
+    last4 = av[-4:]
+    if len(last4) == 4:
+        cf = [x[2].get('cfo') for x in last4]
+        if all(v is not None for v in cf):
+            t = sum(cf); out['cfoTTM'] = r2(t); out['cfoTTMNeg'] = int(t < 0)
+            cx = [x[2].get('capex') for x in last4]
+            if all(v is not None for v in cx):
+                f = t - sum(abs(v) for v in cx)   # 購置固定資產在報表上是負數（流出），一律當流出扣掉
+                out['fcfTTM'] = r2(f); out['fcfTTMNeg'] = int(f < 0)
     return out
 
 
@@ -3100,6 +3215,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
         if ev_end <= buf:
             return None, '股價資料天數不足'
         rev, pxm, inst, trust, foreign = {}, {}, {}, {}, {}
+        cmap = dict(zip(b.date, b.close))   # 2026-11-19 PEG：P/E 日期 → 收盤價
         if include_div:
             try:
                 rev = fetch_revenue_hist(sid, token, rev_days)
@@ -3123,7 +3239,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                 raise
             except Exception:  # noqa
                 vh = None
-        fh = None
+        fh = None; chf = None
         if include_fq:
             try:
                 fh = fetch_fin_hist(sid, token, fq_days)
@@ -3131,6 +3247,12 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                 raise
             except Exception:  # noqa
                 fh = None
+            try:
+                chf = fetch_cf_hist(sid, token, fq_days)   # 2026-11-19 現金流量
+            except FinMindQuotaError:
+                raise
+            except Exception:  # noqa
+                chf = None
         CH = {}
         if include_chip2:   # 融資融券／外資持股：各自前20檔全部失敗（方案不支援）就停止抓
             for k_, fn_ in (('margin', fetch_margin_hist), ('fh', fetch_fh_hist)):
@@ -3169,6 +3291,10 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
                 ex.update(val_asof(vh, ds))
             if fh:
                 ex.update(fin_feats_asof(fh, ds))
+            if chf:
+                ex.update(cf_feats_asof(chf, ds))
+            if include_pe and vh is not None:   # 2026-11-19 PEG
+                ex.update(peg_asof(vh, ds, cmap, ex.get('epsYoY')))
             if CH:
                 ex.update(chip2_feats(b, e, CH))
             ex.update(mkt_chip_feats(ds, mkt_chip))
@@ -6406,7 +6532,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-18 回測加存月營收MoM／YoY原始值'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-19 回測加存現金流量＋PEG'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6551,8 +6677,8 @@ def main():
                        + '　每筆紀錄會附上當天的大盤回撤訊號（需要先建立🔮大盤評分卡；多抓約8次API），用來模擬「減碼＋選股」。')
         bt_div = st.checkbox('📈 近3月YoY乖離度＋月營收（股價歷史要抓超過1年；🛡️全天候 S1／S2 等營收組合要用，務必勾）', value=True, key='bt_div')   # 2026-11-08 預設改勾：沒勾時月營收相關的 S／W 組合全部無法回測
         bt_inst = st.checkbox('🏦 三大法人買賣超（近3月）', key='bt_inst')
-        bt_pe = st.checkbox('📐 本益比／淨值比位階、殖利率（P/E、P/B 近3年百分位；每檔多1次API）', value=True, key='bt_pe')
-        bt_fq = st.checkbox('📑 財報品質：毛利率／營益率／EPS 年增（季報，只用已公布的；每檔多1次API）', value=True, key='bt_fq')
+        bt_pe = st.checkbox('📐 本益比／淨值比位階、殖利率、PEG（P/E、P/B 近3年百分位；PEG 要同時勾財報品質才有 pegQ；每檔多1次API）', value=True, key='bt_pe')
+        bt_fq = st.checkbox('📑 財報品質＋現金流：毛利率／營益率／EPS 年增、營業／自由現金流（季報，只用已公布的；每檔多2次API）', value=True, key='bt_fq')
         bt_chip2 = st.checkbox('🧮 進階籌碼：融資融券／外資持股（每檔多2次API）', value=True, key='bt_chip2',
                                help='外資台指期未平倉、整體融資餘額整次回測只抓一次，不用另外勾。某類資料前20檔都失敗（方案不支援）會自動停止抓取')
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
