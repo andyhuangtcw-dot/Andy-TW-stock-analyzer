@@ -2114,9 +2114,9 @@ def peg_asof(vh, ds, cmap, eps_yoy=None):
                 e0, e1 = c0 / p0, c1 / p1
                 g = (e0 / e1 - 1) * 100
                 out['epsTtmYoY'] = round(g, 2)
-                if g > 0:
+                if g >= 1:   # 2026-11-19 成長<1% 時 PEG 會爆大（上千萬），當作無意義留空
                     out['peg'] = round(p0 / g, 3)
-    if eps_yoy is not None and eps_yoy > 0:
+    if eps_yoy is not None and eps_yoy >= 1:
         out['pegQ'] = round(p0 / eps_yoy, 3)
     return out
 
@@ -6532,7 +6532,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-19 回測加存現金流量＋PEG'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-19 PEG 成長<1%留空'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
