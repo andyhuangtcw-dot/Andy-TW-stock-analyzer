@@ -5175,6 +5175,8 @@ def mark_star(main, k=STAR_N):
     回測（美股 V／Y／Z、台股上櫃三年；勝率等用另一組樣本算）：多頭年化 +13～+58 個百分點、回撤深 6～16 點；空頭 台股上櫃 2022 −16%（20檔 +4%）"""
     main = main.copy()
     main['精選'] = ''
+    if len(main) and main.index.has_duplicates:   # 2026-11-19 合併進度檔後 index 可能重複
+        main = main.reset_index(drop=True)
     if not len(main) or 'S+W命中數' not in main.columns:
         return main, None
     main['S+W命中數'] = pd.to_numeric(main['S+W命中數'], errors='coerce').fillna(0).astype(int)   # 2026-11-19 接續進度檔時可能是文字
@@ -5273,12 +5275,19 @@ def hot_picks(df, k=HOT_N, th=HOT_MIN, excl=None):
     if main is None or not len(main) or 'S+W命中數' not in main.columns:
         return None, None
     # 2026-11-19 修正：從進度檔接續／合併的資料，命中數可能被讀成文字（如 '8.0'）→ 先轉成整數，避免顯示時 int() 出錯、排序錯亂
+    main = main.reset_index(drop=True)   # 2026-11-19 合併進度檔後 index 可能重複，布林篩選會對錯列（NaN 命中數混進來）
     h = pd.to_numeric(main['S+W命中數'], errors='coerce').fillna(0).astype(int)
     v = pd.to_numeric(main['_vol'], errors='coerce').fillna(1e9) if '_vol' in main.columns else 0
     allh = main.assign(**{'S+W命中數': h})[h >= th].assign(_v=v).sort_values(['S+W命中數', '_v'], ascending=[False, True]).drop(columns=['_v'])
     if excl:
         allh = allh[~allh['股票'].astype(str).isin(set(map(str, excl)))]
     return allh.head(k), allh
+
+
+def _hitn(x):
+    """命中數安全轉整數（NaN／文字 → 0）"""
+    v = pd.to_numeric(pd.Series([x]), errors='coerce').iloc[0]
+    return 0 if pd.isna(v) else int(v)
 
 
 HOT_STOP = 15   # 2026-11-19 B方案個股停損：從買進價跌超過 15%（但當天仍標 🚀進攻 就續抱）→ 賣出、空位照常補；到下個檢查日前不再買回
@@ -6554,7 +6563,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-19 修正接續進度後命中數錯誤'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-19 修正接續進度後命中數錯誤(2)'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7077,7 +7086,7 @@ def render_batch(st, ss, K):
             _w = hot_weight(len(_hp) if _hp is not None else 0, _half)
             st.markdown(f'#### 🔥 建議持股（B方案：命中 S／W 組合數 ≥{HOT_MIN} 才買，最多 {HOT_N} 檔、平分資金、單檔上限 {HOT_CAP}%，不足放現金）')
             if _hp is not None and len(_hp):
-                st.markdown('、'.join(f"**{r['股票']} {r['名稱']}**（命中{int(float(r['S+W命中數'] or 0))}）" for _, r in _hp.iterrows())
+                st.markdown('、'.join(f"**{r['股票']} {r['名稱']}**（命中{_hitn(r.get('S+W命中數'))}）" for _, r in _hp.iterrows())
                             + f"　→ **每檔 {_w:g}%**，股票 {len(_hp) * _w:.0f}%｜**現金 {100 - len(_hp) * _w:.0f}%**" + ('　（大盤跌破60日線：已減半）' if _half else '')
                             + (f"｜命中≥{HOT_MIN} 共 {len(_ha)} 檔，取前 {HOT_N}" if len(_ha) > HOT_N else ''))
                 st.dataframe(_hp[[c for c in _cols if c in _hp.columns]], hide_index=True, use_container_width=True)
