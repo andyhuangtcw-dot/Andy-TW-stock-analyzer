@@ -2881,7 +2881,7 @@ def low_mem_concat(frames, sort=True):
             if c not in seen:
                 seen.add(c)
                 cols.append(c)
-    front = [c for c in ('evalDate', 'stockId', 'name') if c in seen]
+    front = [c for c in ('evalDate', 'stockId', 'name', 'sector') if c in seen]
     cols = front + [c for c in cols if c not in front]
     order = None
     if sort and 'evalDate' in seen and 'stockId' in seen:
@@ -2943,9 +2943,9 @@ def store_bt_df(df):
             continue
         if (pd.api.types.is_float_dtype(df[c]) or pd.api.types.is_integer_dtype(df[c])) and df[c].dtype != np.float32:
             df[c] = df[c].astype(np.float32)
-    for c in ('stockId', 'name'):
+    for c in ('stockId', 'name', 'sector'):
         if c in df.columns and not isinstance(df[c].dtype, pd.CategoricalDtype):
-            df[c] = df[c].astype(str).astype('category')
+            df[c] = df[c].fillna('').astype(str).astype('category')
     df['evalDate'] = df['evalDate'].astype(str)
     df.attrs['derived'] = True
     return df
@@ -3317,6 +3317,13 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                     d[c] = pd.to_numeric(d[c], errors='coerce').astype('float32')
             d.insert(1, 'stockId', sid)
             d.insert(2, 'name', names.get(sid, sid))
+            _sec = (_ind_load().get(sid) or ['', ''])[0]   # 2026-11-20 回測多存類股（之後測同類股上限／類股內相對動能用）
+            if not _sec:
+                try:
+                    _sec = fetch_profile(sid, token).get('sector') or ''
+                except Exception:  # noqa
+                    _sec = ''
+            d.insert(3, 'sector', _sec)
             if delay:
                 time.sleep(delay)
             return d, None
@@ -5166,6 +5173,50 @@ def mark_star(main, k=STAR_N):
     return main, up
 
 
+FACTOR_N = 20   # 2026-11-20 美股每月因子選股：檔數
+
+
+# 2026-11-20 追高擁擠組合（S2／W42／S7）：因子前20 排除這三組後，兩段回撤 −19.4→−17.5%、−35.1→−30.2%，報酬不變（29.9→28.9%、22.0→22.8%）
+FACTOR_CHASE_COMBOS = [
+    ['近20日強於大盤≥10%', '中期強勢(12-1月勝大盤≥20%)', 'CMF資金流買方佔優(近20日≥0.1)'],
+    ['多方力道≥65', '中期強勢(12-1月勝大盤≥20%)', 'CMF資金流買方佔優(近20日≥0.1)'],
+    ['高Beta(>1.5)', '布林通道高檔(≥80%)', 'CMF資金流買方佔優(近20日≥0.1)'],
+]
+
+
+def factor_picks(df, n=FACTOR_N):
+    """2026-11-20 美股每月因子選股（台股 B方案那種追短線強勢在美股無效，改用中期動能＋財報品質）：
+    分數＝「半年動能（6-1月勝大盤）」百分位 與「應計比率低（獲利來自現金）」百分位 的平均，取前 n 檔、等比、每月換一次。
+    兩段樣本外驗證（規則先在 2017–19 找到、再拿 2022–26 驗證，沒改參數）：20檔 年化 29.6%／22.3%（同股票池等權 14.1%／11.2%），
+    最大回撤 −21%／−37%；10檔回撤太深（−43%）、45檔報酬較低；加 ROE 或「只買有命中」都變差；但排除 S2／W42／S7 三組追高組合，兩段回撤都變小、報酬不變（見 FACTOR_CHASE_COMBOS）。
+    🔻動能回檔＝中期強勢（12-1月勝大盤≥20%）且（近5日跌≥8% 或 布林位置≤20%）：之後60日超額兩段約 +2～+6%，換股時可優先買，但不單獨當選股條件。
+    排名是在「這次分析的股票」裡算，股票池要夠大（全美股A／B），也要勾「💎 財報品質」才有應計比率"""
+    if df is None or not len(df) or '_rs6' not in df.columns:
+        return None, 0
+    d = df.copy()
+    r6 = pd.to_numeric(d['_rs6'], errors='coerce')
+    ac = pd.to_numeric(d['_accr'], errors='coerce').clip(-100, 100) if '_accr' in d.columns else pd.Series(np.nan, index=d.index)
+    d = d[r6.notna()]
+    if not len(d):
+        return None, 0
+    n_ac = int(ac.loc[d.index].notna().sum())
+    z6 = r6.loc[d.index].rank(pct=True)
+    za = (-ac.loc[d.index]).rank(pct=True).fillna(0.5)
+    d['因子分數'] = ((z6 + za) / 2 * 100).round(1)
+    d['半年動能(勝大盤pp)'] = r6.loc[d.index].round(1)
+    d['應計比率%'] = ac.loc[d.index].round(1)
+    r12 = pd.to_numeric(d.get('_rs12'), errors='coerce')
+    dp = pd.to_numeric(d.get('_drop5'), errors='coerce')
+    bp = pd.to_numeric(d.get('_bbpos'), errors='coerce')
+    d['🔻動能回檔'] = np.where((r12 >= 20) & ((dp <= -8) | (bp <= 20)), '🔻', '')
+    if '_chase' in d.columns:   # 2026-11-20 排除追高擁擠組合（S2／W42／S7）
+        d = d[~d['_chase'].fillna(False).astype(bool)]
+    d = d.sort_values('因子分數', ascending=False).head(n)
+    d['權重%'] = round(100 / max(len(d), 1), 1)
+    d.insert(0, '排名', range(1, len(d) + 1))
+    return d, n_ac
+
+
 def monthly_picks(df, n=None):
     """2026-11-03 投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）最穩的規則：
     主力＝命中 S 或 W、排除⚠️（毛利率年減／近20日平淡／2026-11-06 加：中期弱勢 12-1月輸大盤≥20%），依多方力道取前 n 檔；保守＝營運雙優（毛利率年增＋EPS大幅優於預期）依多方力道取前 n 檔"""
@@ -5323,6 +5374,9 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['S+W命中數'] = len(ms) + len(mw)   # 2026-11-09 ⭐精選5 用
         rec['_vol'] = _rw.get('ivol60') if isnum(_rw.get('ivol60')) else None
         rec['_b60'] = _rw.get('benchmarkAbove60')
+        rec['_chase'] = bool(matched_combos(_rw, FACTOR_CHASE_COMBOS))   # 2026-11-20 因子選股排除追高組合
+        for _k, _f in (('_rs6', 'rs6_1'), ('_rs12', 'rs12_1'), ('_accr', 'accr'), ('_drop5', 'drop5'), ('_bbpos', 'bbPos')):   # 2026-11-20 每月因子選股
+            rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
         # 2026-11-06：再排除「中期弱勢（12-1月輸大盤≥20%）」— V／Y／Q 三樣本疊在 S／W 上超額≈0，排除後組合年化 18.7→24.7%、23.9→26.4%、29.6→31.2%，回撤也都變小
         rec['_warn'] = bool((_gy is not None and _gy <= -2) or (isnum(_rw.get('max1d20')) and _rw['max1d20'] < 3)
                             or (isnum(_rw.get('rs12_1')) and _rw['rs12_1'] <= -20))
@@ -6246,7 +6300,7 @@ LISTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_lis
 
 # 自訂清單：我的清單＋三種組合型態清單（可從批次分析摘要一鍵加入）＋我的清單4
 STYLE_LISTS = [('進攻', '進攻組合型態'), ('穩健', '穩健組合型態'), ('彩券', '彩券組合型態')]
-CUSTOM_SLOTS = ['我的清單'] + [n for _, n in STYLE_LISTS] + ['我的清單4']
+CUSTOM_SLOTS = ['我的清單'] + [n for _, n in STYLE_LISTS] + ['我的清單4', '因子選股20']   # 2026-11-20 每月因子選股
 LIST_RENAME = {'我的清單1': '進攻組合型態', '我的清單2': '穩健組合型態', '我的清單3': '彩券組合型態'}
 
 
@@ -6393,7 +6447,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 回測每1/3存進度、可接續'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 回測加存類股sector'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6966,6 +7020,27 @@ def render_batch(st, ss, K):
                             for i, c in enumerate(K.get('BT_HOT_COMBOS', []))])
         st.dataframe(tw_, hide_index=True, use_container_width=True, height=240)
         st.dataframe(tf_, hide_index=True, use_container_width=True, height=240)
+
+    # 2026-11-20 📅 每月因子選股（中期動能＋財報品質，20檔等比）
+    _fp, _nac = factor_picks(df)
+    if _fp is not None and len(_fp):
+        with st.expander(f'📅 每月因子選股（半年動能＋應計比率低，前 {len(_fp)} 檔、等比、每月換一次）', expanded=True):
+            st.caption('2026-11-20 新做法：台股 B方案那種追短線強勢股在美股無效（強勢股短線反而拉回），美股有效的是中期動能＋財報品質。'
+                       '兩段樣本外驗證：20檔 年化約 30%（2017–19）／22%（2022–26），同股票池等權 14%／11%；最大回撤約 −21%／−37%（比大盤深）。'
+                       '**每月換一次、20檔等比**（10檔回撤 −43% 太深；依排名加權只在一段有幫助；加 S／W 命中組合篩選兩段都變差）。'
+                       '🔻動能回檔＝中期強勢股剛好回檔（近5日跌≥8% 或 布林下緣），之後60日超額較高，換股時可優先買／先買。'
+                       '排名是在這次分析的股票裡算：請用全美股A／B 這類大股票池，並勾「💎 財報品質＋P/E位階」。只有兩段樣本，實際預期年化約 18～25%。')
+            if _nac < max(5, len(df) * 0.3):
+                st.warning(f'⚠️ 只有 {_nac}／{len(df)} 檔有應計比率（沒勾「💎 財報品質＋P/E位階」？），目前排名主要只看半年動能，回撤會比較深')
+            _fc = [c for c in ('排名', '🔻動能回檔', '股票', '名稱', '類股', '股價', '因子分數', '半年動能(勝大盤pp)', '應計比率%', '權重%') if c in _fp.columns]
+            st.dataframe(_fp[_fc], hide_index=True, use_container_width=True)
+            _dip = _fp[_fp['🔻動能回檔'] == '🔻']
+            if len(_dip):
+                st.markdown('🔻 **正在回檔的中期強勢股**（可優先買）：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _dip.iterrows()))
+            if st.button(f'📥 這 {len(_fp)} 檔存成「因子選股20」清單（覆蓋）', key='factor_to_list'):
+                ss['lists']['因子選股20'] = [str(x) for x in _fp['股票']]
+                save_custom_lists(ss['lists'])
+                st.success(f"✅ 已存成「因子選股20」（{len(_fp)} 檔）；下個月再跑一次全美股分析、重新存就是換股")
 
     _pm, _ps = monthly_picks(df)
     if _pm is not None:
