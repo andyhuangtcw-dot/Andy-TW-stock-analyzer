@@ -3315,12 +3315,19 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
             rows = fetch_price(sid, token, price_days)
             b = Bars(rows)
             n = b.n
-            ev_end = n - maxh
-            if ev_end <= buf:
-                return None, f'資料天數不夠（僅{n}筆，需要至少{buf + maxh + 1}筆）'
             # 評估區間起點用「實際抓到的最新一天」往回推（FMP 資料有時不是到今天）
-            win_start = _ds(dt.date.fromisoformat(b.date[-1]) - dt.timedelta(days=(months_back + off) * 30))
-            win_end = _ds(dt.date.fromisoformat(b.date[-1]) - dt.timedelta(days=off * 30)) if off else None
+            # 2026-11-20 修正：已下市股票（最後一筆早於今天超過10天）改用今天往回推，否則評估區間會跟著下市日往前錯位；
+            #   而且一路評估到最後一筆（未來報酬欄位留空），回測才看得到下市前的崩跌
+            _last = dt.date.fromisoformat(b.date[-1])
+            _dead = (dt.date.today() - _last).days > 10
+            _ref = dt.date.today() if _dead else _last
+            ev_end = n if _dead else n - maxh
+            if n - maxh <= buf and not (_dead and n > buf):
+                return None, f'資料天數不夠（僅{n}筆，需要至少{buf + maxh + 1}筆）'
+            win_start = _ds(_ref - dt.timedelta(days=(months_back + off) * 30))
+            win_end = _ds(_ref - dt.timedelta(days=off * 30)) if off else None
+            if _dead and b.date[-1] < win_start:
+                return None, f'已在評估區間前下市（最後交易日 {b.date[-1]}）'
             rev, pxq = {}, {}
             if include_div:
                 try:
@@ -6568,7 +6575,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 回測加已下市股、歷史市值、F分數'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 修正已下市股評估區間錯位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
