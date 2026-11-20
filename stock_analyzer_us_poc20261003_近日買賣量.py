@@ -2140,6 +2140,24 @@ EV_KEYS = ('revSurprise', 'shsChg1y', 'gUp30', 'gDn30', 'insBuyN90', 'insBuyVal9
 VIX_ID = '^VIX'
 
 
+def fetch_div_hist(sid, token):
+    """2026-11-20 除息紀錄 → {除息日: 每股現金股利（已依分割調整）}；回測算含息報酬用（每檔多1次API）"""
+    try:
+        j = fmp_get('/dividends', dict(symbol=to_fmp_symbol(sid)), token)
+    except Exception:  # noqa
+        return {}
+    out = {}
+    for r in j if isinstance(j, list) else []:
+        d = str(r.get('date') or '')[:10]
+        try:
+            v = float(r.get('adjDividend') if r.get('adjDividend') is not None else r.get('dividend'))
+        except Exception:  # noqa
+            continue
+        if len(d) == 10 and v > 0:
+            out[d] = out.get(d, 0.0) + v
+    return out
+
+
 def fetch_shares_hist(sid, token, limit=24):
     """季報加權平均流通股數 → [(可得日, 期末日, 股數)]；可得日用 filingDate，沒有就用期末＋45天"""
     j = fmp_get('/income-statement', dict(symbol=to_fmp_symbol(sid), period='quarter', limit=limit), token)
@@ -3269,6 +3287,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                         fq_state['err'] = str(ex_)[:150]
                         if fq_state['ok'] == 0 and fq_state['fail'] >= 20:
                             fq_state['off'] = True
+            dvh = fetch_div_hist(sid, token)   # 2026-11-20 含息報酬用
             pc = PatternCache(b)
             recs = []
             for e in range(buf, ev_end):
@@ -3305,6 +3324,8 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
                 ec = b.close[e]
                 row['entryClose'] = ec
+                row['entryOpen'] = b.open[e]   # 2026-11-20 隔日開盤成交回測用（下一列的 entryOpen＝隔天開盤）
+                row['divEx'] = dvh.get(ds, 0.0)   # 2026-11-20 當天除息的每股現金股利（含息報酬＝(收盤＋股利)/前收）
                 for h in HORIZONS:
                     row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
                 row.update(exit_feats(b, e))
@@ -6447,7 +6468,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 回測加存類股sector'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 回測加存類股、開盤價、除息'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
