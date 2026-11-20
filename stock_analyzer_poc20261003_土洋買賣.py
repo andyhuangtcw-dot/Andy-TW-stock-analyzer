@@ -5290,6 +5290,21 @@ def _hitn(x):
     return 0 if pd.isna(v) else int(v)
 
 
+HOT_MKT_DROP = 5   # 2026-11-20 加權指數近5日跌超過5% → 當天不買新股（續抱、賣出照常）。十年回測（隔天收盤成交）：年化 57.1→61.0%、回撤 −36.7→−35.6%，2017～21 58.4→61.9%、2022～26 54.5→63.6%；4% 為 60.3%／−36.5%
+
+
+def taiex_r5(token, cache):
+    """加權指數近5個交易日漲跌幅(%)；每天只查一次（FinMind 1次API），失敗回傳 None"""
+    k = _ds(dt.date.today())
+    if k not in cache:
+        try:
+            c = [r['close'] for r in fetch_price('TAIEX', token, 20)]
+            cache[k] = (c[-1] / c[-6] - 1) * 100 if len(c) >= 6 else None
+        except Exception:  # noqa
+            cache[k] = None
+    return cache[k]
+
+
 HOT_STOP = 15   # 2026-11-19 B方案個股停損：從買進價跌超過 15%（但當天仍標 🚀進攻 就續抱）→ 賣出、空位照常補；到下個檢查日前不再買回
 
 
@@ -5312,7 +5327,7 @@ def pick_hold_rets(meta, results):
     return out
 
 
-def pick_rebalance_hot(meta, hot_ids, analyzed, due, k=HOT_N, att_ids=None, rets=None):
+def pick_rebalance_hot(meta, hot_ids, analyzed, due, k=HOT_N, att_ids=None, rets=None, nobuy=False):
     """2026-11-15 🔥B方案換股：檢查日（每月11日、26日）→ 持股只留「命中≥8 前5檔」，其他賣掉，空位補前5檔裡還沒持有的；
     非檢查日 → 不賣，只在有空位時補進新出現的命中≥8股票。沒補滿的部分是現金。
     2026-11-19 🚀進攻續抱（十年回測 年化 153.0→155.5%、回撤 −34.9→−33.9%，兩段都較好）：
@@ -5342,9 +5357,9 @@ def pick_rebalance_hot(meta, hot_ids, analyzed, due, k=HOT_N, att_ids=None, rets
         keep = [s for s in held if s not in sell]
         unk, pool = [], pool_ids
         protk = [s for s in keep if s in prot]
-    buy = [s for s in pool if s not in held][:max(0, k - len(keep) - len(unk))]
+    buy = [] if nobuy else [s for s in pool if s not in held][:max(0, k - len(keep) - len(unk))]   # 2026-11-20 大盤5日急跌不買新股
     new = keep + unk + buy
-    return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=new, due=bool(due), prot=sorted(protk), protk=protk,
+    return dict(keep=keep, sell=sell, unk=unk, buy=buy, new=new, due=bool(due), prot=sorted(protk), protk=protk, nobuy=bool(nobuy),
                 stop=stop, ban=sorted(ban), rets={x: rets.get(x) for x in held})
 
 
@@ -5360,6 +5375,7 @@ def pick_rebalance_hot_text(rb, names, chk=None, half=False):
             f"續抱 {len(rb['keep'])} 檔" + (f"（其中 🚀進攻續抱 {len(rb.get('protk') or [])} 檔：{nm(rb.get('protk') or [])}，🚀進攻標籤消失就賣）" if rb.get('protk') else '')
             + f"｜**該賣 {len(rb['sell'])} 檔**：{nm(rb['sell'])}" + (f"（其中 ⛔停損 {len(rb.get('stop') or [])} 檔：" + '、'.join(f"{x} {names.get(x, '')}（{rb['rets'].get(x, 0):+.1f}%）" for x in rb['stop']) + f"，跌超過 {HOT_STOP}% 且沒標 🚀進攻）" if rb.get('stop') else '')
             + f"｜**該買 {len(rb['buy'])} 檔**：{nm(rb['buy'])}"
+            + (f"（⛔ 加權指數近5日跌超過 {HOT_MKT_DROP}%：今天不買新股，空位先放現金，明天再看）" if rb.get('nobuy') else '')
             + (f"｜⚠️ 這次沒分析到 {len(rb['unk'])} 檔（先續抱，請把它們一起跑）：{nm(rb['unk'])}" if rb['unk'] else '')
             + f"\n\n換股後：{len(rb['new'])} 檔、**每檔 {w:g}%**（檔數變了就把每檔調成這個比例）｜**現金 {100 - len(rb['new']) * w:.0f}%**"
             + ('（大盤跌破60日線：持股減半）' if half else '') + f"\n\n權重：命中≥8 的股票平分資金、單檔上限 {HOT_CAP}%（1檔50%、2檔各50%、3檔各33%、4檔各25%、5檔各20%）")
@@ -6563,7 +6579,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-19 修正接續進度後命中數錯誤(2)'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 大盤5日跌>5%不買新股'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6989,7 +7005,7 @@ def render_batch(st, ss, K):
     if not B or not B['results']:
         st.info('在左側輸入 FinMind API Token 與股票代號，點擊「🔍 批次分析」即可開始。')
         st.markdown('#### 📘 每月操作流程（2026-11-15 改用🔥B方案）')
-        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **🔥 買進（2026-11-15 改用B方案）**　「📦 本月建議組合」最上面的「🔥 建議持股」：只買命中 S／W 組合數 ≥8 的股票（「量能區間低檔＋距52週高點≤5%」這類組合合併只算1）（排除最新一季虧損、連2季營業現金流為負），最多5檔，平分資金、單檔上限50%（1檔50%、2檔各50%、3檔各33%、4檔25%、5檔20%），剩下放現金（沒有符合的就全部現金）。按「📥 🔥建議持股存成我的清單4」開始監控。大盤跌破60日線**不減碼**（2026-11-19 十年回測：不減半 年化約153%／回撤約−35%，減半 124%／−30%，報酬÷回撤反而較差）。（上市＋上櫃10年，樣本外 2017～2021 年化約 124%；0050 約 19%）\n4. **⏳ 補位與換股**　每天（至少每週幾次）跑全市場：有空位、又出現新的命中≥8股票就買進補位，並把每檔調成新的平分比例，**非檢查日不賣**。每月11日、26日（遇假日順延）是檢查日：只留命中≥8前5檔，其他賣掉；**但仍標 🚀進攻 的持股續抱，之後 🚀進攻 標籤一消失就隔天賣；🚀進攻續抱股也佔名額，持股一律最多5檔**（2026-11-19 十年回測：年化 153→155.5%、回撤 −34.9→−33.9%）。「🔄 🔥B方案換股檢查」會直接列出該賣、該買和現金比例，按「套用換股」更新清單4。**個股停損：從買進價跌超過15%、而且當天沒標 🚀進攻 → 賣出，空位照常補，到下個檢查日前不再買回**（2026-11-19 十年回測：年化 155.5→160.8%，樣本外 126→136%，回撤不變；跌停賣不掉時實際效果會打折）。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
+        st.markdown('1. **🔮 更新大盤評分卡（每月一次）**　「🔮 大盤預測」按「執行大盤預測回測」。持股偏好預設「報酬優先」，減碼規則由評分卡依16年回測自動挑。\n2. **📦 選出本月20檔**　左側「🌐 全市場分批自動跑」選上市、上櫃或上市＋上櫃 → 開始 → 「📦 本月建議組合」就是全市場前20檔 → 按「📥 主力組合存成我的清單4」開始監控報酬。（也可以手動：清空清單4 → 分批跑、每批按「➕ 累加」→ 載入清單4再跑一次）　選股規則：命中 S 或 W、排除價格弱勢（低波動／近52週低／動能弱）與「只命中S且P/E<12」，🛡️全天候優先，依多方力道取前20檔。\n3. **🔥 買進（2026-11-15 改用B方案）**　「📦 本月建議組合」最上面的「🔥 建議持股」：只買命中 S／W 組合數 ≥8 的股票（「量能區間低檔＋距52週高點≤5%」這類組合合併只算1）（排除最新一季虧損、連2季營業現金流為負），最多5檔，平分資金、單檔上限50%（1檔50%、2檔各50%、3檔各33%、4檔25%、5檔20%），剩下放現金（沒有符合的就全部現金）。按「📥 🔥建議持股存成我的清單4」開始監控。大盤跌破60日線**不減碼**（2026-11-19 十年回測：不減半的報酬÷回撤較好）。實際可成交（收盤後分析、隔天下單）十年年化約 57%、回撤約 −37%；0050 約 24%。**想提高成交率：收盤前（13:20 左右）勾「盤中即時股價」跑分析，跳過已漲停鎖住的，收盤前下單**（回測約 92%）。\n4. **⏳ 補位與換股**　每天（至少每週幾次）跑全市場：有空位、又出現新的命中≥8股票就買進補位，並把每檔調成新的平分比例，**非檢查日不賣**。每月11日、26日（遇假日順延）是檢查日：只留命中≥8前5檔，其他賣掉；**但仍標 🚀進攻 的持股續抱，之後 🚀進攻 標籤一消失就隔天賣；🚀進攻續抱股也佔名額，持股一律最多5檔**（2026-11-19 十年回測：年化 153→155.5%、回撤 −34.9→−33.9%）。「🔄 🔥B方案換股檢查」會直接列出該賣、該買和現金比例，按「套用換股」更新清單4。**大盤5日跌超過5%：當天不買新股（續抱、賣出照常，空位先放現金）**。**個股停損：從買進價跌超過15%、而且當天沒標 🚀進攻 → 賣出，空位照常補，到下個檢查日前不再買回**（2026-11-19 十年回測：年化 155.5→160.8%，樣本外 126→136%，回撤不變；跌停賣不掉時實際效果會打折）。（2026-11-08 回測：比每20日全換年化多約 +5～+15 個百分點、換股次數差不多；2022 空頭約少1點；改成只買10檔回撤變深、報酬沒變好）\n5. **📍 每天／每週檢查**　跑批次分析看「📋 大盤指引」的 🛡️ 回撤風險與「📅 近60日回撤訊號紀錄」，以及本月建議裡的 📍 組合報酬監控（累計、對大盤超額）。')
         st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
@@ -7082,6 +7098,10 @@ def render_batch(st, ss, K):
                 _epsx = eps_loss_ids(list(_ha['股票'].astype(str))[:12], ss.get('token', '').strip(), ss.setdefault('_epsloss', {}))
                 if _epsx:
                     _hp, _ha = hot_picks(df, excl=_epsx)
+            _r5 = taiex_r5(ss.get('token', '').strip(), ss.setdefault('_taiex5', {}))   # 2026-11-20 大盤5日急跌不買新股
+            _nobuy = _r5 is not None and _r5 <= -HOT_MKT_DROP
+            if _nobuy:
+                st.warning(f'⛔ 加權指數近5日 {_r5:+.1f}%（跌超過 {HOT_MKT_DROP}%）：**今天不買新股**，已持有的照常續抱／賣出，空位先放現金（十年回測：年化 57→61%、回撤 −36.7→−35.6%）')
             _half = False   # 2026-11-19 B方案取消「跌破60日線減半」：十年回測 不減半 年化153%／回撤−35%，減半 124%／−30%（年化÷回撤 4.39＞4.15）
             _w = hot_weight(len(_hp) if _hp is not None else 0, _half)
             st.markdown(f'#### 🔥 建議持股（B方案：命中 S／W 組合數 ≥{HOT_MIN} 才買，最多 {HOT_N} 檔、平分資金、單檔上限 {HOT_CAP}%，不足放現金）')
@@ -7098,7 +7118,7 @@ def render_batch(st, ss, K):
                 st.caption('⛔ 已排除：' + '；'.join(t for t in (('最新一季虧損（EPS<0）：' + '、'.join(_xe)) if _xe else '', ('連2季營業現金流為負：' + '、'.join(_xc)) if _xc else '') if t)
                            + '（10年回測：最新季虧損後20日平均 −0.7%；新版四段回測：連2季現金流出 平均 +2.2%、其他 +9.5%）')
             st.caption(f'權重：命中≥8 的股票平分資金、單檔上限 {HOT_CAP}%（1檔50%、2檔各50%、3檔各33%、4檔各25%、5檔各20%）。'
-                       '上市＋上櫃10年逐日回測（換股日錯開10種取中位數，2026-11-19 版規則：不減碼、🚀進攻續抱、跌15%停損、單檔上限50%）：十年年化約 185%、最大回撤約 −36%；樣本外 2017～2021 約 154%；'
+                       '上市＋上櫃10年逐日回測（換股日錯開10種取中位數，2026-11-19 版規則：不減碼、🚀進攻續抱、跌15%停損、單檔上限50%）：十年年化約 185%（假設收盤一定成交）；**收盤後跑分析、隔天下單（漲停買不到、跌停賣不掉）的實際可成交版本：十年年化約 57%、最大回撤約 −37%，樣本外 2017～2021 約 58%**；當天收盤前用盤中股價跑、跳過已漲停的約 92%／−41%；'
                        '0050 約 24%／−35%。2018、2022 空頭都是正報酬（命中≥8 的股票少，自然多持有現金）。'
                        '操作：每天跑分析，有空位就補新的命中≥8股票；每月11日、26日只留命中≥8前5檔（仍標 🚀進攻 的持股續抱、也佔5檔名額，標籤消失隔天就賣）；**大盤跌破60日線不減碼**（回測減半年化少約29點、回撤只少約5點）。')
             _f277 = [r for r in results if r.get('row') is not None and f277_hit(r['row'])]
@@ -7129,7 +7149,7 @@ def render_batch(st, ss, K):
             _anz = {str(r['stockId']) for r in results} | {str(p['stockId']) for p in (B.get('pool') or [])}
             _ck = check_info((_meta or {}).get('date'), (_trk or {}).get('last') or max((r['bars'].date[-1] for r in results if r.get('bars') is not None), default=''))
             _att = [str(x) for x in df.loc[df['組合型態'] == COMBO_STYLE_ICON['進攻'], '股票']] if '組合型態' in df.columns else []   # 2026-11-19 🚀進攻續抱
-            _rb = pick_rebalance_hot(_meta, list(_ha['股票']) if _ha is not None else [], _anz, bool(_ck and _ck[1]), att_ids=_att, rets=pick_hold_rets(_meta, results))   # 2026-11-15 改用 🔥B方案換股
+            _rb = pick_rebalance_hot(_meta, list(_ha['股票']) if _ha is not None else [], _anz, bool(_ck and _ck[1]), att_ids=_att, rets=pick_hold_rets(_meta, results), nobuy=_nobuy)   # 2026-11-15 改用 🔥B方案換股
             if _rb:
                 _nmap = {str(r['stockId']): r.get('name', '') for r in results}
                 st.markdown(pick_rebalance_hot_text(_rb, _nmap, _ck, _half))

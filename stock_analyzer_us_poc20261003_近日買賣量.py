@@ -2158,6 +2158,66 @@ def fetch_div_hist(sid, token):
     return out
 
 
+def fetch_mcap_hist(sid, token, start, end=None):
+    """2026-11-20 歷史市值 → 依日期排序的 [(日期, 市值十億美元)]；每檔多1次API（FMP 單次最多約5000筆）"""
+    try:
+        j = fmp_get('/historical-market-capitalization', dict(symbol=to_fmp_symbol(sid), limit=5000, **{'from': start, 'to': end or _ds(dt.date.today())}), token)
+    except Exception:  # noqa
+        return []
+    out = []
+    for r in j if isinstance(j, list) else []:
+        d = str(r.get('date') or '')[:10]
+        try:
+            v = float(r.get('marketCap'))
+        except Exception:  # noqa
+            continue
+        if len(d) == 10 and v > 0:
+            out.append((d, v / 1e9))
+    out.sort()
+    return out
+
+
+def mcap_asof(h, ds):
+    i = bisect.bisect_right([x[0] for x in h], ds) - 1 if h else -1
+    return h[i][1] if i >= 0 and ds_days(h[i][0], ds) <= 10 else None
+
+
+def ds_days(a, b):
+    return (dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days
+
+
+_DELIST_BAD = re.compile(r'acquisition|spac|warrant|\bunits?\b|\brights?\b|\bfund\b|\betf\b|\bnotes?\b|preferred|depositary|trust\b|capital corp|merger', re.I)
+
+
+def fetch_delisted(token, since, until, max_pages=300):
+    """2026-11-20 存活者偏差修正：FMP /delisted-companies 逐頁抓 → NYSE／NASDAQ／AMEX、在 since 之後才下市、until 之前已上市的普通股；
+    排除 SPAC／權證／單位／特別股／基金類（名稱判斷）。回傳 [dict(id, name, delisted)]"""
+    out, seen = [], set()
+    for pg in range(max_pages):
+        try:
+            j = fmp_get('/delisted-companies', dict(page=pg, limit=100), token)
+        except Exception:  # noqa
+            break
+        j = j if isinstance(j, list) else []
+        if not j:
+            break
+        old = 0
+        for r in j:
+            sym, nm = str(r.get('symbol') or ''), str(r.get('companyName') or '')
+            dd_, ip = str(r.get('delistedDate') or '')[:10], str(r.get('ipoDate') or '')[:10]
+            if dd_ and dd_ < since:
+                old += 1
+                continue
+            if (not sym or sym in seen or not dd_ or str(r.get('exchange') or '').upper() not in ('NYSE', 'NASDAQ', 'AMEX', 'NYSE AMERICAN', 'NYSEAMERICAN')
+                    or (ip and ip > until) or not re.fullmatch(r'[A-Z]{1,5}', sym) or _DELIST_BAD.search(nm)):
+                continue
+            seen.add(sym)
+            out.append(dict(id=sym, name=nm or sym, delisted=dd_))
+        if old == len(j):   # 整頁都早於 since（清單依下市日新→舊）
+            break
+    return out
+
+
 def fetch_shares_hist(sid, token, limit=24):
     """季報加權平均流通股數 → [(可得日, 期末日, 股數)]；可得日用 filingDate，沒有就用期末＋45天"""
     j = fmp_get('/income-statement', dict(symbol=to_fmp_symbol(sid), period='quarter', limit=limit), token)
@@ -2196,7 +2256,7 @@ def shares_feats(ds, hist, inclusive=False):
 
 
 # ── 2026-11-02 美股新增：財報品質＋P/E 位階（季報 income／balance／cash-flow，都用 filingDate「當時已公布」）──
-FQ_KEYS = ('pe', 'pePct', 'peLoss', 'roe', 'gmYoY', 'gmUp2', 'fcfYld', 'accr')
+FQ_KEYS = ('pe', 'pePct', 'peLoss', 'roe', 'gmYoY', 'gmUp2', 'fcfYld', 'accr', 'fscore', 'gpa')   # 2026-11-20 加 Piotroski F 分數、毛利／總資產
 
 
 def _fq_num(r, *ks):
@@ -2220,7 +2280,9 @@ def fetch_fin_hist(sid, token, limit=24):
     for src, fn in ((inc, lambda r: dict(eps=_fq_num(r, 'epsDiluted', 'epsdiluted', 'eps'), ni=_fq_num(r, 'netIncome'),
                                           rev=_fq_num(r, 'revenue'), gp=_fq_num(r, 'grossProfit'),
                                           sh=_fq_num(r, 'weightedAverageShsOutDil', 'weightedAverageShsOut'))),
-                    (bal, lambda r: dict(eq=_fq_num(r, 'totalStockholdersEquity', 'totalEquity'), ta=_fq_num(r, 'totalAssets'))),
+                    (bal, lambda r: dict(eq=_fq_num(r, 'totalStockholdersEquity', 'totalEquity'), ta=_fq_num(r, 'totalAssets'),
+                                         ltd=_fq_num(r, 'longTermDebt'), ca=_fq_num(r, 'totalCurrentAssets'),
+                                         cl=_fq_num(r, 'totalCurrentLiabilities'))),
                     (cf, lambda r: dict(ocf=_fq_num(r, 'operatingCashFlow', 'netCashProvidedByOperatingActivities'),
                                         capex=_fq_num(r, 'capitalExpenditure')))):
         for r in src if isinstance(src, list) else []:
@@ -2238,6 +2300,37 @@ def fetch_fin_hist(sid, token, limit=24):
 def _ttm(qs, k):
     v = [x.get(k) for x in qs[-4:]]
     return sum(v) if len(v) == 4 and all(a is not None for a in v) else None
+
+
+def piotroski_f(ks):
+    """2026-11-20 Piotroski F 分數（0～9）：近四季 vs 再前四季（要 8 季、期末日跨度約一年）；資料不足回傳 None。
+    獲利：ROA>0、營業現金流>0、ROA上升、現金流>淨利；財務：長債／資產下降、流動比率上升、沒增發股票；效率：毛利率上升、資產週轉率上升"""
+    if not ks or len(ks) < 8:
+        return None
+    c, p = ks[-4:], ks[-8:-4]
+    try:
+        if not 300 <= (dt.date.fromisoformat(c[-1]['d']) - dt.date.fromisoformat(p[-1]['d'])).days <= 430:
+            return None
+    except Exception:  # noqa
+        return None
+    tt = lambda q, k: sum(x[k] for x in q) if all(x.get(k) is not None for x in q) else None
+    ni, ni0, cf, rv, rv0, gp, gp0 = tt(c, 'ni'), tt(p, 'ni'), tt(c, 'ocf'), tt(c, 'rev'), tt(p, 'rev'), tt(c, 'gp'), tt(p, 'gp')
+    ta, ta0 = c[-1].get('ta'), p[-1].get('ta')
+    if ni is None or cf is None or not ta or ta <= 0:
+        return None
+    f = int(ni > 0) + int(cf > 0) + int(cf > ni)
+    if ni0 is not None and ta0 and ta0 > 0:
+        f += int(ni / ta > ni0 / ta0)
+        f += int((c[-1].get('ltd') or 0) / ta < (p[-1].get('ltd') or 0) / ta0)
+        if rv and rv0:
+            f += int(rv / ta > rv0 / ta0)
+    if c[-1].get('ca') and c[-1].get('cl') and p[-1].get('ca') and p[-1].get('cl'):
+        f += int(c[-1]['ca'] / c[-1]['cl'] > p[-1]['ca'] / p[-1]['cl'])
+    if c[-1].get('sh') and p[-1].get('sh'):
+        f += int(c[-1]['sh'] <= p[-1]['sh'] * 1.005)
+    if gp is not None and gp0 is not None and rv and rv0:
+        f += int(gp / rv > gp0 / rv0)
+    return f
 
 
 def fin_feats_series(b, hist, inclusive=False):
@@ -2297,6 +2390,10 @@ def fin_feats_series(b, hist, inclusive=False):
                 return None
             o = min(old, key=lambda x: abs((d1 - dt.date.fromisoformat(x['d'])).days - 365))
             return gm(cur) - gm(o) if gm(o) is not None else None
+        gp4 = _ttm(ks, 'gp')
+        if gp4 is not None and ta and ta > 0:
+            out['gpa'] = gp4 / ta * 100   # 2026-11-20 毛利／總資產（Novy-Marx 獲利能力）
+        out['fscore'] = piotroski_f(ks)
         g1, g2 = yoy(-1), yoy(-2)
         out['gmYoY'] = g1
         if g1 is not None and g2 is not None:
@@ -3183,7 +3280,7 @@ def exit_feats(b, e):
 def run_backtest(token, universe, months_back, include_div, include_sector, min_liq, vp_params,
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
                  stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False,
-                 include_fq=False, skip_ids=None, prior=None, on_part=None, parts=BT_CK_PARTS):
+                 include_fq=False, skip_ids=None, prior=None, on_part=None, parts=BT_CK_PARTS, include_mcap=False):
     """2026-11-20 接續：skip_ids＝進度檔裡已完成的代號（略過不抓）、prior＝已完成的紀錄；on_part 每完成 1/parts 呼叫一次（存進度）。
     回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
     universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
@@ -3288,6 +3385,8 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                         if fq_state['ok'] == 0 and fq_state['fail'] >= 20:
                             fq_state['off'] = True
             dvh = fetch_div_hist(sid, token)   # 2026-11-20 含息報酬用
+            mch = fetch_mcap_hist(sid, token, _ds(dt.date.fromisoformat(win_start) - dt.timedelta(days=15)),
+                                  win_end or None) if include_mcap else []   # 2026-11-20 歷史市值
             pc = PatternCache(b)
             recs = []
             for e in range(buf, ev_end):
@@ -3325,6 +3424,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                 ec = b.close[e]
                 row['entryClose'] = ec
                 row['entryOpen'] = b.open[e]   # 2026-11-20 隔日開盤成交回測用（下一列的 entryOpen＝隔天開盤）
+                row['mcap'] = mcap_asof(mch, ds) if mch else None   # 2026-11-20 當天市值（十億美元）
                 row['divEx'] = dvh.get(ds, 0.0)   # 2026-11-20 當天除息的每股現金股利（含息報酬＝(收盤＋股利)/前收）
                 for h in HORIZONS:
                     row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
@@ -6468,7 +6568,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 回測加存類股、開盤價、除息'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 回測加已下市股、歷史市值、F分數'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6655,6 +6755,10 @@ def main():
         bt_fq = st.checkbox('💎 財報品質＋P/E位階（季報三張表；每檔多3次查詢，股價多抓約2年）', False, key='bt_fq',
                             help='2026-11-02 新增（待回測驗證）：P/E 在自己近3年的百分位、P/E<15／≥40倍、近四季虧損、ROE、毛利率年增／連2季年增、'
                                  '自由現金流殖利率、應計比率（淨利−營業現金流）÷總資產。全部用 filingDate 當時已公布的季報。方案不支援季報時，前20檔都失敗會自動停止抓')
+        bt_delist = st.checkbox('🪦 加入期間已下市股票（修正存活者偏差；每頁多1次API，清單約多幾百～上千檔）', True, key='bt_delist',
+                                help='2026-11-20：FMP /delisted-companies，只收 NYSE／NASDAQ／AMEX 普通股（排除 SPAC、權證、特別股、基金），評估區間開始後才下市、區間結束前已上市的。'
+                                     '一樣套用最低股價／成交金額門檻，A／B 依代號交錯分。只對全美股A／B 有效')
+        bt_mcap = st.checkbox('🏢 歷史市值（每檔多1次API）', True, key='bt_mcap', help='2026-11-20：每筆紀錄存當天市值（十億美元），用來測大小型股、改用當時市值篩股票池')
         bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
         bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
@@ -6845,6 +6949,7 @@ def main():
                     bt_seg = _rm['seg'] if _rm.get('seg') in BT_SEG_OPTIONS else BT_SEG_OPTIONS[0]
                     _o = _rm.get('opts') or {}
                     bt_div, bt_sector, bt_earn, bt_pt, bt_ev, bt_fq = (bool(_o.get(k_)) for k_ in ('div', 'sector', 'earn', 'pt', 'ev', 'fq'))
+                    bt_mcap, bt_delist = bool(_o.get('mcap')), bool(_o.get('delist'))
                     bt_minpx, bt_liq = float(_o.get('minpx', bt_minpx)), _o.get('liq', bt_liq)
                     bt_names.update(_rm.get('names') or {})
                     st.info(f"📂 接續回測：{_rm.get('seg')}・{bt_univ}，已完成 {len(_rm.get('done_ids') or []):,}／{_rm.get('total')} 檔（{len(_prior):,} 筆），只跑剩下的")
@@ -6861,6 +6966,15 @@ def main():
                         uni = fetch_market_universe(token)
                     univ = all2000_part([u['id'] for u in uni], 1 if '-B' in bt_univ else 0)
                     bt_names.update({u['id']: u['name'] for u in uni})
+                    if bt_delist:   # 2026-11-20 存活者偏差修正：加入評估區間開始後才下市的股票
+                        _ws = _ds(dt.date.today() - dt.timedelta(days=int((bt_off + bt_months) * 30.44)))
+                        _we = _ds(dt.date.today() - dt.timedelta(days=int(bt_off * 30.44)))
+                        with st.spinner('🪦 抓取已下市股票清單中…'):
+                            _dl = [u for u in fetch_delisted(token, _ws, _we) if u['id'] not in set(univ)]
+                        _dl = sorted(_dl, key=lambda u: u['id'])[(1 if '-B' in bt_univ else 0)::2]
+                        univ = list(univ) + [u['id'] for u in _dl]
+                        bt_names.update({u['id']: u['name'] for u in _dl})
+                        st.caption(f'🪦 加入已下市股票 {len(_dl):,} 檔（{_ws}～今天之間下市）')
                 except Exception as ex:  # noqa
                     st.error(f'❌ 抓取全美股股票池失敗：{ex}')
                     st.stop()
@@ -6876,7 +6990,7 @@ def main():
                           ids=[str(x) for x in univ], names={str(x): bt_names.get(x, '') for x in univ if bt_names.get(x)},
                           total=len(univ), date=str(dt.date.today()),
                           opts=dict(div=bool(bt_div), sector=bool(bt_sector), earn=bool(bt_earn), pt=bool(bt_pt), ev=bool(bt_ev), fq=bool(bt_fq),
-                                    minpx=float(bt_minpx), liq=bt_liq))
+                                    minpx=float(bt_minpx), liq=bt_liq, mcap=bool(bt_mcap), delist=bool(bt_delist)))
             _ckbox = st.empty()
             _ckn = [0]
             _utag = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff&+-]', '', str(bt_univ))[:20]
@@ -6905,7 +7019,7 @@ def main():
                               text=f'🔬 歷史回測執行中（{bt_seg if bt_seg != BT_SEG_OPTIONS[0] else f"過去{bt_months}個月"}）：{i} / {total}')
                 det.caption((f'最近完成：{last_sid["v"]}　' if i < total else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔'
                             + (f'　｜{note}' if note else ''))
-            df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp,
+            df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp, include_mcap=bt_mcap,
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx),
                                    end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev,
                                    include_fq=bt_fq, skip_ids=(_rm or {}).get('done_ids'), prior=_prior, on_part=_on_part)
