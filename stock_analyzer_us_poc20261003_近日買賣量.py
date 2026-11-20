@@ -5684,14 +5684,102 @@ def pick_candidate(r, K):
                 or (isnum(rw.get('rs12_1')) and rw['rs12_1'] <= -20))
 
 
-FULL_CHUNK = 300   # 2026-11-06 全市場分批：每批幾檔
+FULL_CHUNK = 200   # 2026-11-12 全市場分批：每批幾檔（降低記憶體）
 
 
-def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, chunk=FULL_CHUNK, log=None, progress=None, names=None):
+FM_CKPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fm_ckpt_us.json.gz')   # 2026-11-12 伺服器端自動存進度（session 斷線但 App 沒重開時可還原）
+
+
+def fm_ckpt_save(data, done_n, cand_n):
+    try:
+        with open(FM_CKPT_FILE, 'wb') as fh:
+            fh.write(data)
+        with open(FM_CKPT_FILE + '.meta', 'w', encoding='utf-8') as fh:
+            json.dump(dict(time=dt.datetime.now().strftime('%m/%d %H:%M'), done=done_n, cand=cand_n), fh)
+    except Exception:  # noqa
+        pass
+
+
+def fm_ckpt_meta():
+    try:
+        with open(FM_CKPT_FILE + '.meta', 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:  # noqa
+        return None
+
+
+def _univ_tag():
+    """2026-11-12 進度／結果檔名標示股票池（上傳多檔時分得清楚）"""
+    import streamlit as _st
+    t = str(_st.session_state.get('fm_univ') or '')
+    return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff＋+]', '', t.replace('清單', '').replace('（約2000檔）', '')) or '全市場'
+
+
+def fm_ckpt_merge(ds):
+    """2026-11-12 多個進度／結果檔合併（例如上市、上櫃各跑一次）：股票池、已分析、候選股取聯集，摘要列合併 → 按開始只重跑候選股，選出合併後的前20檔"""
+    ds = [d for d in ds if d]
+    if not ds:
+        return None
+    if len(ds) == 1:
+        return ds[0]
+    out = dict(v=1, date=max(str(d.get('date') or '') for d in ds), stocks=[], done=[], cand_ids=[], pool=[], diag={})
+    seen = {k: set() for k in ('stocks', 'done', 'cand_ids')}
+    pool_ids = set()
+    for d in ds:
+        for k in ('stocks', 'done', 'cand_ids'):
+            for x in d.get(k) or []:
+                if str(x) not in seen[k]:
+                    seen[k].add(str(x))
+                    out[k].append(str(x))
+        for p in d.get('pool') or []:
+            if str(p.get('stockId')) not in pool_ids:
+                pool_ids.add(str(p.get('stockId')))
+                out['pool'].append(p)
+        for k, v in (d.get('diag') or {}).items():
+            if k != 'n' and isinstance(v, (int, float)):
+                out['diag'][k] = out['diag'].get(k, 0) + v
+    return out
+
+
+def fm_ckpt_bytes(state):
+    """2026-11-12 全市場分批進度檔（.json.gz）：已分析清單、候選股代號、其他股票的摘要列。App 重開（記憶體超限）後上傳就能接著跑；
+    候選股只存代號，接續時重新分析（數量少），其他股票直接用存下的摘要"""
+    import gzip
+    st_ = dict(state)
+    st_['pool'] = [dict(stockId=p['stockId'], name=p.get('name'), total=p.get('total'),
+                        row={k: v for k, v in (p.get('row') or {}).items() if not k.startswith('_')}) for p in state.get('pool') or []]
+    return gzip.compress(json.dumps(st_, ensure_ascii=False, default=_json_default).encode('utf-8'))
+
+
+def fm_ckpt_load(f):
+    import gzip
+    raw = f.read() if hasattr(f, 'read') else f
+    try:
+        raw = gzip.decompress(raw)
+    except Exception:  # noqa
+        pass
+    d = json.loads(raw.decode('utf-8'))
+    for p in d.get('pool') or []:
+        p['lite'] = True
+        p['row'] = p.get('row') or {}
+    return d
+
+
+def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, chunk=FULL_CHUNK, log=None, progress=None, names=None, resume=None, on_batch=None):
     """2026-11-06 全市場分批自動跑：每批算完只留「本月建議候選股」的完整結果，其他股票只留一列摘要（給大盤溫度計算廣度），
     K線等大資料直接丟掉 → 記憶體只跟候選股數量有關。每檔的多方力道／命中只看自己的資料，結果跟一次跑完全市場相同"""
     log = log or (lambda m: None)
-    cands, pool, nb = [], [], (len(stocks) + chunk - 1) // chunk
+    # 2026-11-12 從進度檔接續：已分析的非候選股直接用存下的摘要，候選股（只存代號）重新分析
+    resume = resume or {}
+    _rc = set(str(x) for x in resume.get('cand_ids') or [])
+    _done0 = [str(x) for x in resume.get('done') or []]
+    pool0 = [p for p in resume.get('pool') or [] if str(p.get('stockId')) not in _rc]
+    _skip = set(_done0) - _rc
+    todo = [x for x in stocks if str(x) not in _skip]
+    done = [x for x in _done0 if x not in _rc]
+    full_stocks = stocks
+    stocks = todo
+    cands, pool, nb = [], list(pool0), (len(stocks) + chunk - 1) // chunk
     _held = set(str(x) for x in ((load_pick_meta() or {}).get('ids') or []))
     for k in range(nb):
         part = stocks[k * chunk:(k + 1) * chunk]
@@ -5703,6 +5791,14 @@ def full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay, K, ch
                 cands.append(r)
             else:
                 pool.append(dict(stockId=r['stockId'], name=r['name'], total=r['total'], row=r['row'], lite=True))
+        done.extend(str(x) for x in part)
+        if on_batch:
+            try:
+                on_batch(dict(v=1, date=str(dt.date.today()), stocks=[str(x) for x in full_stocks], done=list(done),
+                              cand_ids=[str(r['stockId']) for r in cands], pool=pool,
+                              diag=dict(locals().get('diag') or {})), k + 1, nb)
+            except Exception:  # noqa
+                pass
         del res
         gc.collect()
         log(f'🌐 第 {k + 1}/{nb} 批完成：已分析 {len(cands) + len(pool)} 檔，本月建議候選累計 {len(cands)} 檔')
@@ -6211,7 +6307,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-12 十年回測段'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-12 進度檔股票池聯集＋檔名標市場'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6330,7 +6426,19 @@ def main():
             st.number_input('每批檔數', 50, 800, FULL_CHUNK, 50, key='fm_chunk', help='每批算完只留本月建議候選股的完整結果，其他股票丟掉K線只留摘要')
             st.caption('依序分批分析整個股票池（上面勾的API選項一樣適用），最後只保留本月建議候選股，'
                        '「📦 本月建議組合」就是全市場前20檔。全美股約2000檔，每檔約3～6次API，時間看每分鐘上限。')
+            st.file_uploader('📂 從進度檔接續／合併（可一次選多個檔，例如上市＋上櫃結果檔；上傳後再按開始）', type=['gz', 'json'], key='fm_resume', accept_multiple_files=True,
+                             help='全市場分批每跑完一批，畫面會出現「💾 下載進度檔」。App 因記憶體超限重開時，結果會消失；把最後下載的進度檔傳到這裡再按開始，'
+                                  '已分析的股票不用重跑（候選股會重新分析，數量少）。全部跑完的結果檔也可以傳，幾分鐘就能還原本月建議組合。')
             run_full = st.button('🌐 開始全市場分批分析', use_container_width=True, key='run_full')
+            _fmm = fm_ckpt_meta() if os.path.exists(FM_CKPT_FILE) else None
+            if _fmm:
+                if st.button(f"♻️ 還原／接續上次全市場分析（{_fmm.get('time')}，已分析 {_fmm.get('done', 0):,} 檔、候選 {_fmm.get('cand', 0)} 檔）",
+                             use_container_width=True, key='fm_restore'):
+                    run_full = True
+                    ss['fm_restore_go'] = True
+                else:
+                    ss['fm_restore_go'] = False
+                st.caption('畫面結果消失但 App 沒有整台重開時可用（伺服器上自動存的進度）；App 整台重開會清掉，要用下載的進度檔')
         cg, cv = st.columns(2)
         if cg.button('🔥 漲幅前100', use_container_width=True, help='全市場約2000檔逐檔查報價，約需7～10分鐘'):
             ss['pending_top100'] = 'gain'
@@ -6489,8 +6597,44 @@ def main():
 
                 def _prog(i, n):
                     prog.progress(min(1.0, i / n), text=f'🌐 全市場分批分析中：{i} / {n}')
+                # 2026-11-12 進度檔：上傳了就接續；每批跑完提供下載
+                _resume = None
+                if ss.get('fm_restore_go') and not ss.get('fm_resume') and os.path.exists(FM_CKPT_FILE):   # ♻️ 伺服器端進度
+                    try:
+                        with open(FM_CKPT_FILE, 'rb') as fh:
+                            _resume = fm_ckpt_load(fh)
+                        if _resume.get('stocks'):
+                            stocks = list(stocks) + [x for x in _resume['stocks'] if x not in set(map(str, stocks))]   # 2026-11-12 股票池取聯集：上傳上市檔＋選上市＋上櫃 → 只接著跑上櫃
+                        st.info(f"♻️ 從伺服器上的進度接續：已分析 {len(_resume.get('done') or []):,}／{len(stocks):,} 檔")
+                    except Exception as _ex:  # noqa
+                        _resume = None
+                if ss.get('fm_resume'):
+                    try:
+                        _fs = ss['fm_resume'] if isinstance(ss['fm_resume'], list) else [ss['fm_resume']]
+                        for _f in _fs:
+                            _f.seek(0)
+                        _resume = fm_ckpt_merge([fm_ckpt_load(_f) for _f in _fs])
+                        if _resume.get('stocks'):
+                            stocks = list(stocks) + [x for x in _resume['stocks'] if x not in set(map(str, stocks))]   # 2026-11-12 股票池取聯集：上傳上市檔＋選上市＋上櫃 → 只接著跑上櫃
+                        st.info(f"📂 從進度檔接續：已分析 {len(_resume.get('done') or []):,}／{len(stocks):,} 檔，候選股 {len(_resume.get('cand_ids') or [])} 檔會重新分析")
+                    except Exception as _ex:  # noqa
+                        _resume = None
+                        st.warning(f'進度檔讀取失敗，改成從頭跑：{_ex}')
+                _ckbox = st.empty()
+                _ckn = [0]
+
+                def _on_batch(state, k, nb):
+                    _ckn[0] += 1
+                    data = fm_ckpt_bytes(state)
+                    ss['fm_ckpt_last'] = data
+                    fm_ckpt_save(data, len(state['done']), len(state['cand_ids']))
+                    _ckbox.download_button(f'💾 下載進度檔（第 {k}/{nb} 批完成，已分析 {len(state["done"]):,} 檔；App 重開後上傳可接續）', data=data,
+                                           file_name=f'全市場進度_{_univ_tag()}_{dt.date.today():%Y%m%d}_{len(state["done"])}檔.json.gz', mime='application/gzip',
+                                           key=f'fm_ck_{_ckn[0]}_{int(time.time())}', on_click='ignore', use_container_width=True)
+                # 2026-11-12 本月建議要用的財報品質（毛利率年減排除、營運雙優等）一律打開
+                ex_flags = dict(ex_flags, fq=True)
                 cands, pool = full_market_analyze(stocks, token, days, use_rt, ex_flags, vpp, req_delay, K,
-                                                  int(ss.get('fm_chunk') or FULL_CHUNK), _log, _prog, names=names)
+                                                  int(ss.get('fm_chunk') or FULL_CHUNK), _log, _prog, names=names, resume=_resume, on_batch=_on_batch)
                 prog.empty()
                 logbox.empty()
                 ss['batch'] = dict(results=cands, extras=ex_flags, vpp=vpp, pool=pool + cands,
@@ -6598,6 +6742,9 @@ def render_batch(st, ss, K):
         st.caption('回測三年偏多頭、部分樣本內、有存活者偏差，實際報酬通常會打折；以 📍 組合報酬監控的實際結果為準。')
         return
     results, exf, vpp = B['results'], B['extras'], B['vpp']
+    if B.get('full') and ss.get('fm_ckpt_last'):
+        st.download_button('💾 下載本次全市場結果檔（App 重開後在「🌐 全市場分批自動跑」上傳，幾分鐘就能還原本月建議組合）', data=ss['fm_ckpt_last'],
+                           file_name=f'全市場結果_{_univ_tag()}_{dt.date.today():%Y%m%d}.json.gz', mime='application/gzip', key='fm_ck_final', on_click='ignore')
     if B.get('full'):
         st.info(f"🌐 全市場分批自動跑：分析 {B['full']['n']:,} 檔（成功 {B['full']['ok']:,} 檔），只保留本月建議候選股 {B['full']['cand']} 檔的完整結果；"
                 '其他股票只用來算大盤溫度計。下方摘要表只列候選股，「📦 本月建議組合」直接就是全市場前20檔。')
