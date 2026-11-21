@@ -5312,6 +5312,39 @@ FACTOR_CHASE_COMBOS = [
 ]
 
 
+def factor_holding_check(df, ids):
+    """2026-11-20 🔎 持股體檢：把手上股票放進這次全美股因子排名裡看位置。
+    十年回測（大盤從60日高點跌超過10～15% 時、個股已從一年高點跌≥50%）：因子排名前30% 之後120日平均 +59～+78%（上漲 77～84%），
+    中間 40% 只有 +8～+11%、後30% +26～+30%；同期大盤 +17～+26%。所以前30% 續抱，其餘考慮換成本月因子選股20檔"""
+    if df is None or not len(df) or '_rs6' not in df.columns:
+        return None
+    d = df.copy()
+    r6 = pd.to_numeric(d['_rs6'], errors='coerce')
+    ac = pd.to_numeric(d['_accr'], errors='coerce').clip(-100, 100) if '_accr' in d.columns else pd.Series(np.nan, index=d.index)
+    d = d[r6.notna()]
+    sc = (r6.loc[d.index].rank(pct=True) + (-ac.loc[d.index]).rank(pct=True).fillna(0.5)) / 2
+    pct = sc.rank(pct=True)
+    want = [x.strip().upper() for x in ids if x.strip()]
+    rows = []
+    for t in want:
+        m = d[d['股票'].astype(str).str.upper() == t]
+        if not len(m):
+            rows.append({'股票': t, '名稱': '', '因子分數': None, '排名': '不在這次分析中', '半年動能(勝大盤pp)': None, '應計比率%': None,
+                         '距一年高點%': None, '追高組合': '', '建議': '加進股票池／自選清單一起跑全美股分析'})
+            continue
+        i = m.index[0]; r = d.loc[i]; top = (1 - pct.loc[i]) * 100
+        ch = bool(r.get('_chase')) if '_chase' in d.columns else False
+        adv = ('🟢 續抱（前30%，急跌後反彈最強）' if top <= 30 and not ch else
+               '🟡 前30%但屬追高擁擠組合，續抱但不加碼' if top <= 30 else
+               '🔴 考慮換成本月因子選股（中間段急跌後反彈最弱）' if top <= 70 else
+               '🟠 弱勢，考慮換成本月因子選股')
+        h52 = pd.to_numeric(r.get('_hi52'), errors='coerce')
+        rows.append({'股票': t, '名稱': r.get('名稱', ''), '因子分數': round(float(sc.loc[i]) * 100, 1), '排名': f'前 {top:.0f}%（{int((pct > pct.loc[i]).sum()) + 1}／{len(d)}）',
+                     '半年動能(勝大盤pp)': round(float(r6.loc[i]), 1), '應計比率%': None if pd.isna(ac.loc[i]) else round(float(ac.loc[i]), 1),
+                     '距一年高點%': None if pd.isna(h52) else round(float(h52), 1), '追高組合': '是' if ch else '', '建議': adv})
+    return pd.DataFrame(rows)
+
+
 def factor_picks(df, n=FACTOR_N):
     """2026-11-20 美股每月因子選股（台股 B方案那種追短線強勢在美股無效，改用中期動能＋財報品質）：
     分數＝「半年動能（6-1月勝大盤）」百分位 與「應計比率低（獲利來自現金）」百分位 的平均，取前 n 檔、等比、每月換一次。
@@ -5503,7 +5536,7 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['_vol'] = _rw.get('ivol60') if isnum(_rw.get('ivol60')) else None
         rec['_b60'] = _rw.get('benchmarkAbove60')
         rec['_chase'] = bool(matched_combos(_rw, FACTOR_CHASE_COMBOS))   # 2026-11-20 因子選股排除追高組合
-        for _k, _f in (('_rs6', 'rs6_1'), ('_rs12', 'rs12_1'), ('_accr', 'accr'), ('_drop5', 'drop5'), ('_bbpos', 'bbPos')):   # 2026-11-20 每月因子選股
+        for _k, _f in (('_rs6', 'rs6_1'), ('_rs12', 'rs12_1'), ('_accr', 'accr'), ('_drop5', 'drop5'), ('_bbpos', 'bbPos'), ('_hi52', 'high52Dist')):   # 2026-11-20 每月因子選股
             rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
         # 2026-11-06：再排除「中期弱勢（12-1月輸大盤≥20%）」— V／Y／Q 三樣本疊在 S／W 上超額≈0，排除後組合年化 18.7→24.7%、23.9→26.4%、29.6→31.2%，回撤也都變小
         rec['_warn'] = bool((_gy is not None and _gy <= -2) or (isnum(_rw.get('max1d20')) and _rw['max1d20'] < 3)
@@ -6575,7 +6608,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 修正已下市股評估區間錯位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-20 因子選股加持股體檢'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7179,6 +7212,18 @@ def render_batch(st, ss, K):
             _dip = _fp[_fp['🔻動能回檔'] == '🔻']
             if len(_dip):
                 st.markdown('🔻 **正在回檔的中期強勢股**（可優先買）：' + '、'.join(f"{r['股票']} {r['名稱']}" for _, r in _dip.iterrows()))
+            # 2026-11-20 🔎 持股體檢
+            _hold = st.text_input('🔎 持股體檢：輸入手上的美股代號（逗號分隔），看在這次全美股因子排名的位置', ss.get('factor_hold', ''), key='factor_hold_in',
+                                  placeholder='例如 AEHR, BE, COHR, ARM, AXTI, UMC, HIMX')
+            if _hold.strip():
+                ss['factor_hold'] = _hold
+                _hc = factor_holding_check(df, _hold.replace('，', ',').split(','))
+                if _hc is not None:
+                    if len(df) < 300:
+                        st.warning(f'⚠️ 這次只分析 {len(df)} 檔，排名只在這些股票之間比；要用全美股A／B（約 1,000 檔以上）排名才有意義')
+                    st.dataframe(_hc, hide_index=True, use_container_width=True)
+                    st.caption('十年回測（大盤急跌、個股已跌≥50% 時）：因子排名前30% 之後120日平均 +59～+78%，中間40% 只有 +8～+11%，後30% +26～+30%（同期大盤 +17～+26%）。'
+                               '前30% 續抱；其餘考慮換成上面的因子選股20檔，大跌當天不要換、分 2～3 次換。有融資先降槓桿。只是回測統計，不保證未來。')
             if st.button(f'📥 這 {len(_fp)} 檔存成「因子選股20」清單（覆蓋）', key='factor_to_list'):
                 ss['lists']['因子選股20'] = [str(x) for x in _fp['股票']]
                 save_custom_lists(ss['lists'])
