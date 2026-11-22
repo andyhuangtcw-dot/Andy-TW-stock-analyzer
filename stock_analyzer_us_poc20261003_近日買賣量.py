@@ -3430,6 +3430,8 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
                 ec = b.close[e]
                 row['entryClose'] = ec
+                _s0 = max(0, e - 19)   # 2026-11-20 近20日平均成交金額（百萬美元），測成交量縮小股票池用
+                row['dv20'] = sum(b.close[k] * b.volume[k] for k in range(_s0, e + 1)) / (e + 1 - _s0) / 1e6
                 row['entryOpen'] = b.open[e]   # 2026-11-20 隔日開盤成交回測用（下一列的 entryOpen＝隔天開盤）
                 row['mcap'] = mcap_asof(mch, ds) if mch else None   # 2026-11-20 當天市值（十億美元）
                 row['divEx'] = dvh.get(ds, 0.0)   # 2026-11-20 當天除息的每股現金股利（含息報酬＝(收盤＋股利)/前收）
@@ -5301,7 +5303,8 @@ def mark_star(main, k=STAR_N):
     return main, up
 
 
-FACTOR_N = 20   # 2026-11-20 美股每月因子選股：檔數
+FACTOR_N = 20
+FACTOR_SEC_CAP = 5   # 2026-11-22 同類股（FMP sector）最多5檔：十年回測 28.2→28.5%、43.4→44.6%、23.2→24.4%，回撤持平或略淺；2026/10～11 軟體股崩跌時回撤少約2pp   # 2026-11-20 美股每月因子選股：檔數
 
 
 # 2026-11-20 追高擁擠組合（S2／W42／S7）：因子前20 排除這三組後，兩段回撤 −19.4→−17.5%、−35.1→−30.2%，報酬不變（29.9→28.9%、22.0→22.8%）
@@ -5310,6 +5313,35 @@ FACTOR_CHASE_COMBOS = [
     ['多方力道≥65', '中期強勢(12-1月勝大盤≥20%)', 'CMF資金流買方佔優(近20日≥0.1)'],
     ['高Beta(>1.5)', '布林通道高檔(≥80%)', 'CMF資金流買方佔優(近20日≥0.1)'],
 ]
+
+
+def rocket_flag(row, b):
+    """2026-11-21 🚀修正期強勢股（只提醒）＝W13＋W16＋W14 的即時版：大盤跌破60日線、中期強勢(12-1月勝大盤≥20)、半年強勢(6-1月勝大盤≥10)、
+    近20日仍強於大盤、而且近10天內曾出現「5日跌≥8%」。十年回測（起漲前10天同時命中這3組）：之後60日超額 +8.7／+8.2／+10.0pp，
+    半年內漲一倍的機率是一般股票 6～15 倍；但訊號集中在少數幾次大盤修正，放進20檔優先買反而變差，所以只標記"""
+    try:
+        if row.get('benchmarkAbove60') not in (0, False, 0.0):
+            return False
+        if not (isnum(row.get('rs12_1')) and row['rs12_1'] >= 20 and isnum(row.get('rs6_1')) and row['rs6_1'] >= 10
+                and isnum(row.get('relStrength20')) and row['relStrength20'] > 0):
+            return False
+        c = b.close if b is not None else []
+        if len(c) < 16:
+            return False
+        return any(c[i - 5] > 0 and c[i] / c[i - 5] - 1 <= -0.08 for i in range(len(c) - 10, len(c)))
+    except Exception:  # noqa
+        return False
+
+
+def factor_overheat(df):
+    """2026-11-21 ⚠️飆股過熱（只提醒、不排除）：近60日已漲≥50%，CMF 或 +DI 在這次分析前20%，而且近3日沒有爆量（量能比不在前20%）。
+    十年回測：已漲≥50% 的股票之後60日，CMF／+DI 前20% 比後20% 少 1～12pp、大盤站上20日線再少 3～12pp；近3日爆量反而多 3～19pp。
+    因子20檔排除這類股票：年化 28.2→28.1%、43.4→45.6%、23.2→23.8%（改善在誤差內，所以只標記）"""
+    if df is None or not len(df):
+        return pd.Series(dtype=bool)
+    q = lambda c: pd.to_numeric(df[c], errors='coerce').rank(pct=True) if c in df.columns else pd.Series(np.nan, index=df.index)
+    p60 = pd.to_numeric(df['_p60'], errors='coerce') if '_p60' in df.columns else pd.Series(np.nan, index=df.index)
+    return ((p60 >= 50) & ((q('_cmf') >= 0.8) | (q('_pdi') >= 0.8)) & ~(q('_v3') >= 0.8)).fillna(False)
 
 
 def factor_holding_check(df, ids):
@@ -5324,13 +5356,14 @@ def factor_holding_check(df, ids):
     d = d[r6.notna()]
     sc = (r6.loc[d.index].rank(pct=True) + (-ac.loc[d.index]).rank(pct=True).fillna(0.5)) / 2
     pct = sc.rank(pct=True)
+    oh = factor_overheat(df)
     want = [x.strip().upper() for x in ids if x.strip()]
     rows = []
     for t in want:
         m = d[d['股票'].astype(str).str.upper() == t]
         if not len(m):
             rows.append({'股票': t, '名稱': '', '因子分數': None, '排名': '不在這次分析中', '半年動能(勝大盤pp)': None, '應計比率%': None,
-                         '距一年高點%': None, '追高組合': '', '建議': '加進股票池／自選清單一起跑全美股分析'})
+                         '距一年高點%': None, '追高組合': '', '🚀修正期強勢': '', '⚠️飆股過熱': '', '建議': '加進股票池／自選清單一起跑全美股分析'})
             continue
         i = m.index[0]; r = d.loc[i]; top = (1 - pct.loc[i]) * 100
         ch = bool(r.get('_chase')) if '_chase' in d.columns else False
@@ -5341,7 +5374,10 @@ def factor_holding_check(df, ids):
         h52 = pd.to_numeric(r.get('_hi52'), errors='coerce')
         rows.append({'股票': t, '名稱': r.get('名稱', ''), '因子分數': round(float(sc.loc[i]) * 100, 1), '排名': f'前 {top:.0f}%（{int((pct > pct.loc[i]).sum()) + 1}／{len(d)}）',
                      '半年動能(勝大盤pp)': round(float(r6.loc[i]), 1), '應計比率%': None if pd.isna(ac.loc[i]) else round(float(ac.loc[i]), 1),
-                     '距一年高點%': None if pd.isna(h52) else round(float(h52), 1), '追高組合': '是' if ch else '', '建議': adv})
+                     '距一年高點%': None if pd.isna(h52) else round(float(h52), 1), '追高組合': '是' if ch else '',
+                     '🚀修正期強勢': '🚀' if bool(r.get('_rocket')) else '',
+                     '⚠️飆股過熱': '⚠️' if bool(oh.get(i, False)) else '', '建議': adv + ('；⚠️飆股過熱：下次換股可優先換掉' if bool(oh.get(i, False)) else '')
+                     + ('；🚀修正期強勢股：歷史上反彈最強，短線急跌不要急著賣' if bool(r.get('_rocket')) else '')})
     return pd.DataFrame(rows)
 
 
@@ -5370,9 +5406,20 @@ def factor_picks(df, n=FACTOR_N):
     dp = pd.to_numeric(d.get('_drop5'), errors='coerce')
     bp = pd.to_numeric(d.get('_bbpos'), errors='coerce')
     d['🔻動能回檔'] = np.where((r12 >= 20) & ((dp <= -8) | (bp <= 20)), '🔻', '')
+    d['⚠️飆股過熱'] = np.where(factor_overheat(df).reindex(d.index).fillna(False), '⚠️', '')   # 2026-11-21 只標記
+    d['🚀修正期強勢'] = np.where(d['_rocket'].fillna(False).astype(bool), '🚀', '') if '_rocket' in d.columns else ''
     if '_chase' in d.columns:   # 2026-11-20 排除追高擁擠組合（S2／W42／S7）
         d = d[~d['_chase'].fillna(False).astype(bool)]
-    d = d.sort_values('因子分數', ascending=False).head(n)
+    d = d.sort_values('因子分數', ascending=False)
+    if FACTOR_SEC_CAP and '_sec' in d.columns:   # 2026-11-22 同類股最多5檔（沒有類股資料的不限）
+        _cnt, _keep = {}, []
+        for _i, _sv in zip(d.index, d['_sec'].fillna('').astype(str)):
+            if _sv and _cnt.get(_sv, 0) >= FACTOR_SEC_CAP:
+                continue
+            _cnt[_sv] = _cnt.get(_sv, 0) + 1
+            _keep.append(_i)
+        d = d.loc[_keep]
+    d = d.head(n)
     d['權重%'] = round(100 / max(len(d), 1), 1)
     d.insert(0, '排名', range(1, len(d) + 1))
     return d, n_ac
@@ -5536,6 +5583,15 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['_vol'] = _rw.get('ivol60') if isnum(_rw.get('ivol60')) else None
         rec['_b60'] = _rw.get('benchmarkAbove60')
         rec['_chase'] = bool(matched_combos(_rw, FACTOR_CHASE_COMBOS))   # 2026-11-20 因子選股排除追高組合
+        try:   # 2026-11-21 ⚠️飆股過熱：近60日漲幅、CMF、+DI、近3日量能比
+            _bc = r['bars'].close
+            rec['_p60'] = (_bc[-1] / _bc[-61] - 1) * 100 if len(_bc) > 61 and _bc[-61] > 0 else None
+        except Exception:  # noqa
+            rec['_p60'] = None
+        for _k, _f in (('_cmf', 'cmf20'), ('_pdi', 'plusDI'), ('_v3', 'vol3Ratio')):
+            rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
+        rec['_rocket'] = rocket_flag(_rw, r.get('bars'))   # 2026-11-21 🚀修正期強勢股
+        rec['_sec'] = r.get('sector') or (_ind_load().get(r['stockId']) or ['', ''])[0] or ''   # 2026-11-22 同類股上限用
         for _k, _f in (('_rs6', 'rs6_1'), ('_rs12', 'rs12_1'), ('_accr', 'accr'), ('_drop5', 'drop5'), ('_bbpos', 'bbPos'), ('_hi52', 'high52Dist')):   # 2026-11-20 每月因子選股
             rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
         # 2026-11-06：再排除「中期弱勢（12-1月輸大盤≥20%）」— V／Y／Q 三樣本疊在 S／W 上超額≈0，排除後組合年化 18.7→24.7%、23.9→26.4%、29.6→31.2%，回撤也都變小
@@ -6608,7 +6664,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 因子選股加持股體檢'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-22 因子選股同類股最多5檔'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7204,10 +7260,13 @@ def render_batch(st, ss, K):
                        '兩段樣本外驗證：20檔 年化約 30%（2017–19）／22%（2022–26），同股票池等權 14%／11%；最大回撤約 −21%／−37%（比大盤深）。'
                        '**每月換一次、20檔等比**（10檔回撤 −43% 太深；依排名加權只在一段有幫助；加 S／W 命中組合篩選兩段都變差）。'
                        '🔻動能回檔＝中期強勢股剛好回檔（近5日跌≥8% 或 布林下緣），之後60日超額較高，換股時可優先買／先買。'
+                       f'同類股（FMP sector）最多 {FACTOR_SEC_CAP} 檔，超過的跳過、往下遞補（十年回測報酬略升、回撤持平或略淺，避免 2026/10～11 那種 12 檔軟體股一起崩）。'
+                       '🚀修正期強勢＝大盤跌破60日線時，中期＋半年都強、近10天急跌過≥8% 但仍強於大盤（W13＋W16＋W14）：歷史上最常見的飆股起漲型態，之後60日超額約 +8～+10%，短線跌8% 不要急著賣。'
+                       '⚠️飆股過熱＝近60日已漲≥50%、CMF 或 +DI 偏高（前20%）但近3日沒爆量：之後續航較弱，只提醒不排除，可少買或下次換股優先換掉。'
                        '排名是在這次分析的股票裡算：請用全美股A／B 這類大股票池，並勾「💎 財報品質＋P/E位階」。只有兩段樣本，實際預期年化約 18～25%。')
             if _nac < max(5, len(df) * 0.3):
                 st.warning(f'⚠️ 只有 {_nac}／{len(df)} 檔有應計比率（沒勾「💎 財報品質＋P/E位階」？），目前排名主要只看半年動能，回撤會比較深')
-            _fc = [c for c in ('排名', '🔻動能回檔', '股票', '名稱', '類股', '股價', '因子分數', '半年動能(勝大盤pp)', '應計比率%', '權重%') if c in _fp.columns]
+            _fc = [c for c in ('排名', '🔻動能回檔', '🚀修正期強勢', '⚠️飆股過熱', '股票', '名稱', '類股', '股價', '因子分數', '半年動能(勝大盤pp)', '應計比率%', '權重%') if c in _fp.columns]
             st.dataframe(_fp[_fc], hide_index=True, use_container_width=True)
             _dip = _fp[_fp['🔻動能回檔'] == '🔻']
             if len(_dip):
