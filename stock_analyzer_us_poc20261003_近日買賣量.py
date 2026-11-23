@@ -4924,6 +4924,68 @@ def mp_panel_line(pr):
             + (f"　→ 持股策略：{pr['pick']}" if pr.get('pick') else '　→ 持股策略模擬沒有比永遠滿倉更好的方式，建議持股維持原規則'))
 
 
+# ── 2026-11-23 📈 大盤指標歷史下載：給離線回測測試哪些外部指標能提早預警（信用利差、殖利率曲線、銅金比、廣度、風險偏好、就業）──
+MKT_IND_SYMS = [('SPY', 'S&P500'), ('RSP', '等權S&P500'), ('QQQ', 'Nasdaq100'), ('IWM', '小型股'), ('^VIX', 'VIX'), ('^VIX3M', 'VIX 3個月'),
+                ('HYG', '高收益債'), ('JNK', '高收益債2'), ('LQD', '投資級公司債'), ('IEF', '7-10年公債'), ('TLT', '20年公債'), ('SHY', '1-3年公債'),
+                ('XLY', '非必需消費'), ('XLP', '必需消費'), ('XLK', '科技'), ('SMH', '半導體'), ('XLF', '金融'), ('XLU', '公用事業'),
+                ('UUP', '美元'), ('GLD', '黃金ETF'), ('CPER', '銅ETF'), ('GCUSD', '黃金期貨'), ('HGUSD', '銅期貨'), ('CLUSD', '原油期貨')]
+MKT_IND_ECON = ('initialClaims', 'unemploymentRate', 'federalFunds', 'consumerSentiment', 'smoothedUSRecessionProbabilities', 'CPI')
+
+
+def mkt_ind_export(token, years, prog=None):
+    """回傳 (csv.gz bytes, 摘要文字)。長格式：date, series, value；經濟數據的 date 是資料所屬期間（不是公布日），回測時要自己往後遞延"""
+    start = dt.date.today() - dt.timedelta(days=int(years * 365.25))
+    rows, ok, bad = [], [], []
+    tot = len(MKT_IND_SYMS) + 1 + len(MKT_IND_ECON)
+    for k, (sym, nm) in enumerate(MKT_IND_SYMS):
+        if prog:
+            prog(k / tot, f'{sym} {nm}')
+        try:
+            for r in fetch_price(sym, token, start=start):
+                rows.append((r['date'], sym, r['close']))
+            ok.append(sym)
+        except Exception as ex:  # noqa
+            bad.append(f'{sym}（{str(ex)[:40]}）')
+    if prog:
+        prog(len(MKT_IND_SYMS) / tot, '公債殖利率')
+    d0, n0 = start, len(rows)
+    try:
+        while d0 <= dt.date.today():
+            d1 = min(dt.date.today(), d0 + dt.timedelta(days=89))
+            j = fmp_get('/treasury-rates', {'from': _ds(d0), 'to': _ds(d1)}, token)
+            for x in (j if isinstance(j, list) else []):
+                for col in ('month3', 'year2', 'year10', 'year30'):
+                    v = _mpf(x.get(col))
+                    if v is not None and x.get('date'):
+                        rows.append((str(x['date'])[:10], 'UST_' + col, v))
+            d0 = d1 + dt.timedelta(days=1)
+        ok.append('公債殖利率') if len(rows) > n0 else bad.append('公債殖利率（無資料）')
+    except Exception as ex:  # noqa
+        bad.append(f'公債殖利率（{str(ex)[:40]}）')
+    for k, nm in enumerate(MKT_IND_ECON):
+        if prog:
+            prog((len(MKT_IND_SYMS) + 1 + k) / tot, nm)
+        try:
+            j = fmp_get('/economic-indicators', {'name': nm, 'from': _ds(start), 'to': _ds(dt.date.today())}, token)
+            n1 = 0
+            for x in (j if isinstance(j, list) else []):
+                v = _mpf(x.get('value'))
+                if v is not None and x.get('date'):
+                    rows.append((str(x['date'])[:10], 'ECO_' + nm, v)); n1 += 1
+            ok.append(nm) if n1 else bad.append(f'{nm}（無資料）')
+        except Exception as ex:  # noqa
+            bad.append(f'{nm}（{str(ex)[:40]}）')
+    if prog:
+        prog(1.0, '完成')
+    df = pd.DataFrame(rows, columns=['date', 'series', 'value']).drop_duplicates(['date', 'series']).sort_values(['series', 'date'])
+    import gzip
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
+        gz.write(df.to_csv(index=False).encode('utf-8'))
+    msg = f'成功 {len(ok)} 項、共 {len(df):,} 筆' + (f'；抓不到：{"、".join(bad)}' if bad else '')
+    return buf.getvalue(), msg
+
+
 def render_market_pred(st, ss, K):
     st.subheader('🔮 大盤預測評分卡（walk-forward 樣本外驗證）')
     st.caption('用 10 年以上的大盤層級指標（' + MP_DESC + '），每半年只用「當時以前」的資料重算各指標權重，預測下半年。'
@@ -4952,6 +5014,24 @@ def render_market_pred(st, ss, K):
                                '下方顯示的是這次重建的結果，僅供比較；要改用這張，請下載後用下方「載入」上傳。')
             except Exception as ex:  # noqa
                 st.error(f'❌ 大盤預測回測失敗：{ex}')
+    with st.expander('📈 下載大盤指標歷史（給 Claude 測哪些指標能提早預警）', expanded=False):
+        st.caption('抓 SPY／RSP／IWM／VIX／VIX3M、信用債（HYG、LQD、IEF）、類股（XLY、XLP、SMH…）、美元、黃金、銅、原油、公債殖利率、'
+                   '初領失業金／失業率／聯邦基金利率／消費者信心／衰退機率，存成一個 .csv.gz。約 30 次 API，1～2 分鐘。')
+        _iy = st.slider('年數', 5, 20, 12, key='mi_years')
+        if st.button('📈 開始下載', key='mi_run'):
+            tok = ss.get('token', '').strip()
+            if not tok:
+                st.error('請先輸入 API Key')
+            else:
+                _pb = st.progress(0.0)
+                try:
+                    ss['_mi_csv'], ss['_mi_msg'] = mkt_ind_export(tok, _iy, prog=lambda f, t: _pb.progress(min(1.0, f), text=t))
+                except Exception as ex:  # noqa
+                    st.error(f'❌ 下載失敗：{ex}')
+        if ss.get('_mi_csv'):
+            st.caption(ss.get('_mi_msg', ''))
+            st.download_button('💾 下載大盤指標（.csv.gz）', ss['_mi_csv'], file_name=f'美股大盤指標_{dt.date.today()}.csv.gz',
+                               mime='application/gzip', key='mi_dl', on_click='ignore')
     up_ = st.file_uploader('或載入先前下載的評分卡（.json；Streamlit Cloud 重新啟動後本機檔案會消失，可用這個還原）', type=['json'], key='mp_up')
     if up_ is not None and ss.get('_mp_up_sig') != (up_.name, up_.size):
         try:
@@ -5304,6 +5384,7 @@ def mark_star(main, k=STAR_N):
 
 
 FACTOR_N = 20
+FACTOR_F_MIN = 6   # 2026-11-22 只從 F 分數≥6 的股票選；大盤「急跌」或「V型反彈」時暫停（見 market_regime）
 FACTOR_SEC_CAP = 5   # 2026-11-22 同類股（FMP sector）最多5檔：十年回測 28.2→28.5%、43.4→44.6%、23.2→24.4%，回撤持平或略淺；2026/10～11 軟體股崩跌時回撤少約2pp   # 2026-11-20 美股每月因子選股：檔數
 
 
@@ -5331,6 +5412,52 @@ def rocket_flag(row, b):
         return any(c[i - 5] > 0 and c[i] / c[i - 5] - 1 <= -0.08 for i in range(len(c) - 10, len(c)))
     except Exception:  # noqa
         return False
+
+
+MKT_PAUSE_DAYS = 120   # 2026-11-23 急跌後暫停 F≥6 門檻的天數
+
+
+def market_regime(closes, dates):
+    """2026-11-22 大盤狀態（用 SPY 收盤）：
+    急跌＝收盤比60日高點低≥15% 而且 比30日高點低≥10%（跌得又深又快）；
+    急跌後＝最近一次急跌在120天內（2026-11-23 改：原本「90天內且反彈≥10%」在 2020 下半年太早恢復 F 門檻，14組樣本 改成120天 回撤勝 11→12/14）；其餘＝正常。
+    12組半年樣本：F≥6 只在「正常」時套用 → 平均報酬 +6.6→+8.5%、回撤 −19.4→−17.3%（報酬勝 7/12、回撤勝 9/12）；
+    一律套用 F≥6 只有 +5.8%（2020 COVID 反彈大輸）。2022 上半年那種慢慢跌的空頭仍會套用（F≥6 那段 +9.6% vs −2.0%）。
+    回傳 (狀態, 說明)"""
+    c = [x for x in closes if x]
+    if len(c) < 61:
+        return '正常', '大盤資料不足，視為正常'
+    n = len(c)
+    crash = [False] * n
+    for i in range(60, n):
+        h60, h30 = max(c[i - 59:i + 1]), max(c[i - 29:i + 1])
+        crash[i] = c[i] / h60 - 1 <= -0.15 and c[i] / h30 - 1 <= -0.10
+    dd60 = (c[-1] / max(c[-60:]) - 1) * 100
+    up = (c[-1] / min(c[-60:]) - 1) * 100
+    info = f'SPY 距60日高點 {dd60:+.1f}%、距60日低點 {up:+.1f}%'
+    if crash[-1]:
+        return '急跌', info
+    last = max((i for i in range(n) if crash[i]), default=None)
+    if last is not None:
+        try:
+            days = (dt.date.fromisoformat(str(dates[-1])[:10]) - dt.date.fromisoformat(str(dates[last])[:10])).days
+        except Exception:  # noqa
+            days = (n - 1 - last) * 1.45
+        if days <= MKT_PAUSE_DAYS:
+            return 'V反彈', info + f'（{str(dates[last])[:10]} 急跌，{int(days)} 天前；120 天後恢復 F 門檻）'
+    return '正常', info
+
+
+def fscore_tag(f, fp):
+    """2026-11-22 F 分數標記（只提醒、不排除）。12組半年樣本：只買 F≥6 平均回撤 −19.4→−17.3%（9/12 組較淺），
+    但報酬 +6.6→+5.8%（2018 年底急跌、2020 COVID 反彈都大幅落後）。F 從≥6 掉到<6（財報轉差）之後60日平均落後大盤 1.6pp"""
+    if f is None or (isinstance(f, float) and np.isnan(f)):
+        return ''
+    f = int(f)
+    if f >= 6:
+        return str(f)
+    dropped = fp is not None and not (isinstance(fp, float) and np.isnan(fp)) and fp >= 6
+    return f'{f} ⚠️' + ('↓轉差' if dropped else '')
 
 
 def factor_overheat(df):
@@ -5363,7 +5490,7 @@ def factor_holding_check(df, ids):
         m = d[d['股票'].astype(str).str.upper() == t]
         if not len(m):
             rows.append({'股票': t, '名稱': '', '因子分數': None, '排名': '不在這次分析中', '半年動能(勝大盤pp)': None, '應計比率%': None,
-                         '距一年高點%': None, '追高組合': '', '🚀修正期強勢': '', '⚠️飆股過熱': '', '建議': '加進股票池／自選清單一起跑全美股分析'})
+                         '距一年高點%': None, '追高組合': '', '🚀修正期強勢': '', 'F分數': '', '⚠️飆股過熱': '', '建議': '加進股票池／自選清單一起跑全美股分析'})
             continue
         i = m.index[0]; r = d.loc[i]; top = (1 - pct.loc[i]) * 100
         ch = bool(r.get('_chase')) if '_chase' in d.columns else False
@@ -5375,13 +5502,14 @@ def factor_holding_check(df, ids):
         rows.append({'股票': t, '名稱': r.get('名稱', ''), '因子分數': round(float(sc.loc[i]) * 100, 1), '排名': f'前 {top:.0f}%（{int((pct > pct.loc[i]).sum()) + 1}／{len(d)}）',
                      '半年動能(勝大盤pp)': round(float(r6.loc[i]), 1), '應計比率%': None if pd.isna(ac.loc[i]) else round(float(ac.loc[i]), 1),
                      '距一年高點%': None if pd.isna(h52) else round(float(h52), 1), '追高組合': '是' if ch else '',
-                     '🚀修正期強勢': '🚀' if bool(r.get('_rocket')) else '',
+                     '🚀修正期強勢': '🚀' if bool(r.get('_rocket')) else '', 'F分數': fscore_tag(r.get('_fs'), r.get('_fsp')),
                      '⚠️飆股過熱': '⚠️' if bool(oh.get(i, False)) else '', '建議': adv + ('；⚠️飆股過熱：下次換股可優先換掉' if bool(oh.get(i, False)) else '')
-                     + ('；🚀修正期強勢股：歷史上反彈最強，短線急跌不要急著賣' if bool(r.get('_rocket')) else '')})
+                     + ('；🚀修正期強勢股：歷史上反彈最強，短線急跌不要急著賣' if bool(r.get('_rocket')) else '')
+                     + ('；F 分數從≥6 掉到<6（財報轉差）：下次換股可優先換掉' if '轉差' in fscore_tag(r.get('_fs'), r.get('_fsp')) else '')})
     return pd.DataFrame(rows)
 
 
-def factor_picks(df, n=FACTOR_N):
+def factor_picks(df, n=FACTOR_N, regime='正常'):
     """2026-11-20 美股每月因子選股（台股 B方案那種追短線強勢在美股無效，改用中期動能＋財報品質）：
     分數＝「半年動能（6-1月勝大盤）」百分位 與「應計比率低（獲利來自現金）」百分位 的平均，取前 n 檔、等比、每月換一次。
     兩段樣本外驗證（規則先在 2017–19 找到、再拿 2022–26 驗證，沒改參數）：20檔 年化 29.6%／22.3%（同股票池等權 14.1%／11.2%），
@@ -5408,6 +5536,13 @@ def factor_picks(df, n=FACTOR_N):
     d['🔻動能回檔'] = np.where((r12 >= 20) & ((dp <= -8) | (bp <= 20)), '🔻', '')
     d['⚠️飆股過熱'] = np.where(factor_overheat(df).reindex(d.index).fillna(False), '⚠️', '')   # 2026-11-21 只標記
     d['🚀修正期強勢'] = np.where(d['_rocket'].fillna(False).astype(bool), '🚀', '') if '_rocket' in d.columns else ''
+    d['F分數'] = [fscore_tag(a, b) for a, b in zip(d.get('_fs', pd.Series(None, index=d.index)), d.get('_fsp', pd.Series(None, index=d.index)))]
+    d.attrs['f_applied'] = False
+    if FACTOR_F_MIN and regime == '正常' and '_fs' in d.columns:   # 2026-11-22 F≥6 門檻（急跌／V反彈時暫停）
+        _fsv = pd.to_numeric(d['_fs'], errors='coerce')
+        if _fsv.notna().mean() >= 0.3:   # 沒勾💎財報品質（多數沒有 F 分數）就不套用
+            d = d[_fsv >= FACTOR_F_MIN]
+            d.attrs['f_applied'] = True
     if '_chase' in d.columns:   # 2026-11-20 排除追高擁擠組合（S2／W42／S7）
         d = d[~d['_chase'].fillna(False).astype(bool)]
     d = d.sort_values('因子分數', ascending=False)
@@ -5419,7 +5554,9 @@ def factor_picks(df, n=FACTOR_N):
             _cnt[_sv] = _cnt.get(_sv, 0) + 1
             _keep.append(_i)
         d = d.loc[_keep]
+    _fa = d.attrs.get('f_applied', False)
     d = d.head(n)
+    d.attrs['f_applied'] = _fa
     d['權重%'] = round(100 / max(len(d), 1), 1)
     d.insert(0, '排名', range(1, len(d) + 1))
     return d, n_ac
@@ -5592,6 +5729,8 @@ def summary_frame(results, extras_flags, K, live=None):
             rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
         rec['_rocket'] = rocket_flag(_rw, r.get('bars'))   # 2026-11-21 🚀修正期強勢股
         rec['_sec'] = r.get('sector') or (_ind_load().get(r['stockId']) or ['', ''])[0] or ''   # 2026-11-22 同類股上限用
+        rec['_fs'] = _rw.get('fscore') if isnum(_rw.get('fscore')) else None   # 2026-11-22 F 分數（只標記）
+        rec['_fsp'] = _rw.get('fscorePrev') if isnum(_rw.get('fscorePrev')) else None
         for _k, _f in (('_rs6', 'rs6_1'), ('_rs12', 'rs12_1'), ('_accr', 'accr'), ('_drop5', 'drop5'), ('_bbpos', 'bbPos'), ('_hi52', 'high52Dist')):   # 2026-11-20 每月因子選股
             rec[_k] = _rw.get(_f) if isnum(_rw.get(_f)) else None
         # 2026-11-06：再排除「中期弱勢（12-1月輸大盤≥20%）」— V／Y／Q 三樣本疊在 S／W 上超額≈0，排除後組合年化 18.7→24.7%、23.9→26.4%、29.6→31.2%，回撤也都變小
@@ -5954,7 +6093,13 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
                 tech['vix'] = vx_live[1][-1]
             if ex_flags.get('fq'):   # 財報品質＋P/E 位階（季報三張表，用已公布的最新四季）
                 try:
-                    tech.update(fin_feats_series(bl, fetch_fin_hist(sid, token, limit=16), inclusive=True)[1](bl.n - 1))
+                    _fh = fetch_fin_hist(sid, token, limit=16)
+                    tech.update(fin_feats_series(bl, _fh, inclusive=True)[1](bl.n - 1))
+                    try:   # 2026-11-22 上一季財報時的 F 分數（偵測「F 從≥6 掉到<6」）
+                        _kh = sorted([h for h in _fh if h.get('av') and h['av'] <= _ds(dt.date.today())], key=lambda h: h['d'])
+                        tech['fscorePrev'] = piotroski_f(_kh[:-1]) if len(_kh) > 8 else None
+                    except Exception:  # noqa
+                        tech['fscorePrev'] = None
                 except Exception as ex2:  # noqa
                     extras['fqErr'] = str(ex2)[:150]
             if ex_flags.get('ev'):   # 評等升降／內部人買進／流通股數（各 1 次 API，內部人可能 1～2 次）
@@ -6664,7 +6809,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-22 因子選股同類股最多5檔'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-23 大盤指標歷史下載'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7253,20 +7398,34 @@ def render_batch(st, ss, K):
         st.dataframe(tf_, hide_index=True, use_container_width=True, height=240)
 
     # 2026-11-20 📅 每月因子選股（中期動能＋財報品質，20檔等比）
-    _fp, _nac = factor_picks(df)
+    _rk = _ds(dt.date.today())   # 2026-11-22 大盤狀態（SPY，每天查一次）
+    if ss.get('_mkt_regime_day') != _rk:
+        try:
+            _bm = fetch_price(BENCHMARK_ID, ss.get('token', '').strip() or ss.get('api_key', '').strip(), 200)
+            ss['_mkt_regime'] = market_regime([x['close'] for x in _bm], [x['date'] for x in _bm])
+        except Exception as _e:  # noqa
+            ss['_mkt_regime'] = ('正常', f'SPY 抓取失敗（{str(_e)[:60]}），視為正常')
+        ss['_mkt_regime_day'] = _rk
+    _reg, _reginfo = ss.get('_mkt_regime', ('正常', ''))
+    _fp, _nac = factor_picks(df, regime=_reg)
     if _fp is not None and len(_fp):
         with st.expander(f'📅 每月因子選股（半年動能＋應計比率低，前 {len(_fp)} 檔、等比、每月換一次）', expanded=True):
+            st.markdown(f"**大盤狀態：{ {'正常': '🟢 正常', '急跌': '🔴 急跌', 'V反彈': '🟡 急跌後反彈期'}.get(_reg, _reg)}**（{_reginfo}）— "
+                        + ('已套用 **F分數≥6** 門檻' if _fp.attrs.get('f_applied') else
+                           ('急跌／V反彈期間 **暫停 F≥6 門檻**（崩盤後領漲的常是財報差的股票）' if _reg != '正常' else
+                            '⚠️ 多數股票沒有 F 分數（沒勾「💎 財報品質」），**未套用 F≥6 門檻**')))
             st.caption('2026-11-20 新做法：台股 B方案那種追短線強勢股在美股無效（強勢股短線反而拉回），美股有效的是中期動能＋財報品質。'
                        '兩段樣本外驗證：20檔 年化約 30%（2017–19）／22%（2022–26），同股票池等權 14%／11%；最大回撤約 −21%／−37%（比大盤深）。'
                        '**每月換一次、20檔等比**（10檔回撤 −43% 太深；依排名加權只在一段有幫助；加 S／W 命中組合篩選兩段都變差）。'
                        '🔻動能回檔＝中期強勢股剛好回檔（近5日跌≥8% 或 布林下緣），之後60日超額較高，換股時可優先買／先買。'
                        f'同類股（FMP sector）最多 {FACTOR_SEC_CAP} 檔，超過的跳過、往下遞補（十年回測報酬略升、回撤持平或略淺，避免 2026/10～11 那種 12 檔軟體股一起崩）。'
+                       'F分數＝Piotroski 財報健康度（0～9）：<6 標 ⚠️（回測：只買 F≥6 回撤較淺但報酬略低，所以只提醒）；「↓轉差」＝最新財報從≥6 掉到<6，之後60日平均落後大盤 1.6pp，下次換股可優先換掉。'
                        '🚀修正期強勢＝大盤跌破60日線時，中期＋半年都強、近10天急跌過≥8% 但仍強於大盤（W13＋W16＋W14）：歷史上最常見的飆股起漲型態，之後60日超額約 +8～+10%，短線跌8% 不要急著賣。'
                        '⚠️飆股過熱＝近60日已漲≥50%、CMF 或 +DI 偏高（前20%）但近3日沒爆量：之後續航較弱，只提醒不排除，可少買或下次換股優先換掉。'
                        '排名是在這次分析的股票裡算：請用全美股A／B 這類大股票池，並勾「💎 財報品質＋P/E位階」。只有兩段樣本，實際預期年化約 18～25%。')
             if _nac < max(5, len(df) * 0.3):
                 st.warning(f'⚠️ 只有 {_nac}／{len(df)} 檔有應計比率（沒勾「💎 財報品質＋P/E位階」？），目前排名主要只看半年動能，回撤會比較深')
-            _fc = [c for c in ('排名', '🔻動能回檔', '🚀修正期強勢', '⚠️飆股過熱', '股票', '名稱', '類股', '股價', '因子分數', '半年動能(勝大盤pp)', '應計比率%', '權重%') if c in _fp.columns]
+            _fc = [c for c in ('排名', '🔻動能回檔', '🚀修正期強勢', '⚠️飆股過熱', '股票', '名稱', '類股', '股價', '因子分數', 'F分數', '半年動能(勝大盤pp)', '應計比率%', '權重%') if c in _fp.columns]
             st.dataframe(_fp[_fc], hide_index=True, use_container_width=True)
             _dip = _fp[_fp['🔻動能回檔'] == '🔻']
             if len(_dip):
