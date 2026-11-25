@@ -3682,7 +3682,7 @@ def heat_light_lines(pred):
     else:
         verdict = '沒有明顯訊號：依建議持股正常操作'
     on = [(nm, why) for _, nm, o, why in L if o]
-    return [f"・🚦 **🔥 動能燈 {nh}/3**：{row('動能', '🔥')}　｜　**🟢 反彈燈 {nr}/3**：{row('反彈', '🟢')}　｜　⚠️ {row('警示', '⚠️')}　｜　參考：{row('參考', 'ℹ️')}（效果不明）",
+    return [f"・🚦 **🔥 動能燈 {nh}/3**：{row('動能', '🔥')}　｜　**🟢 反彈燈 {nr}/3**：{row('反彈', '🟢')}　｜　警示燈：{row('警示', '⚠️')}　｜　參考：{row('參考', 'ℹ️')}（效果不明）",
             f"・訊號燈判讀：{verdict}" + ('（亮燈條件：' + '；'.join(f'{nm}＝{why}' for nm, why in on) + '）' if on else '')]
 
 
@@ -3698,7 +3698,7 @@ def dd_risk_lines(pred):
     marks = '　'.join(('🔴' if nm in d['on'] else '⚪') + nm for nm in d['all'])
     ap = d.get('apply')
     if ap and (d.get('cut') or dd_apply_hit(ap, d)):
-        act = f"→ 依評分卡驗證過的規則「{dd_rule_text(ap)}」，建議持股再減" + (f" {d['cut']}%" if d.get('cut') else '')
+        act = f"→ 依評分卡驗證過的規則「{dd_rule_text(ap)}」" + (f"，已從上面的建議持股扣掉 {d['cut']}%（不用再另外減）" if d.get('cut') else '，建議持股減碼')
     elif ap:
         act = f"→ 減碼規則「{dd_rule_text(ap)}」（目前未達）"
     else:
@@ -4128,7 +4128,8 @@ def market_guide_lines(mt, kp, pred=None):
         if _why and _adj != ps[0]:
             ps = (_adj, '依訊號燈調整', ps[2], ps[3] + f'；溫度計＋K線原本 {ps[0]}%，{_why}')
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
-                   + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
+                   + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷')
+                   + '　📌 這是**大盤部位（0050 等 ETF）**的建議；**B方案選股維持 100%**（回測：滿倉年化約57%，跌破60日線減半只剩約44%、回撤只少約1.6點）')
     if kp:
         dd, rsi, ma = kp['dd60'], kp['rsi'], kp['ma']
         why = [f"距60日高 {dd:+.1f}%（{'已達' if dd <= -10 else '未達'} -10% 超賣門檻）",
@@ -4837,9 +4838,10 @@ def mp_live(token, sc):
 def mp_guide_text(pred, ps0):
     """大盤指引的建議持股行（評分卡持股策略模擬勝過永遠滿倉時）"""
     rk = pred['models'].get('risk') or {}
-    return (f"・**建議持股 {pred['pos']}%（依大盤預測評分卡持股策略：{pred.get('pick')}；目前風險模型第 {rk.get('q', '--')}/5 級）**　"
+    return (f"・**建議持股 {pred['pos']}%（依大盤預測評分卡持股策略：{pred.get('pick')}；目前風險模型第 {rk.get('q', '--')}/5 級，第1級＝最危險）**　"
             + (f"風險模型：未來20日期間跌≥5% 機率 {rk['dd5']:.0f}%、平均最大跌幅 {rk['mdd']:.1f}%" if rk else '')
-            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）")
+            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）"
+            + '　📌 這是**大盤部位（0050 等 ETF）**的建議；**B方案選股維持 100%**（回測：滿倉年化約57%，跌破60日線減半只剩約44%、回撤只少約1.6點）')
 
 
 def mp_panel_line(pr):
@@ -6675,7 +6677,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-25 美股外部風險燈'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-25 建議持股註明只限大盤部位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>

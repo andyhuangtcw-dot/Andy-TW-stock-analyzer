@@ -4278,7 +4278,8 @@ def market_guide_lines(mt, kp, pred=None):
         if _why and _adj != ps[0]:
             ps = (_adj, '依訊號燈調整', ps[2], ps[3] + f'；溫度計＋K線原本 {ps[0]}%，{_why}')
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
-                   + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
+                   + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷')
+                   + '　📌 這是**大盤部位（SPY／VOO 等 ETF）**的建議；**因子選股 20 檔維持 100%**（回測：滿倉年化約29%，減碼規則都少賺、回撤只少一點）')
     if kp:
         dd, rsi, ma = kp['dd60'], kp['rsi'], kp['ma']
         why = [f"距60日高 {dd:+.1f}%（{'已達' if dd <= -10 else '未達'} -10% 超賣門檻）",
@@ -4905,7 +4906,8 @@ def mp_guide_text(pred, ps0):
     rk = pred['models'].get('risk') or {}
     return (f"・**建議持股 {pred['pos']}%（依大盤預測評分卡持股策略：{pred.get('pick')}；目前風險模型第 {rk.get('q', '--')}/5 級）**　"
             + (f"風險模型：未來20日期間跌≥5% 機率 {rk['dd5']:.0f}%、平均最大跌幅 {rk['mdd']:.1f}%" if rk else '')
-            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）")
+            + f"（原本溫度計＋K線規則為 {ps0 if ps0 is not None else '--'}%）"
+            + '　📌 這是**大盤部位（SPY／VOO 等 ETF）**的建議；**因子選股 20 檔維持 100%**（回測：滿倉年化約29%，減碼規則都少賺、回撤只少一點）')
 
 
 def mp_panel_line(pr):
@@ -4984,6 +4986,62 @@ def mkt_ind_export(token, years, prog=None):
         gz.write(df.to_csv(index=False).encode('utf-8'))
     msg = f'成功 {len(ok)} 項、共 {len(df):,} 筆' + (f'；抓不到：{"、".join(bad)}' if bad else '')
     return buf.getvalue(), msg
+
+
+# ── 2026-11-23 🚨 外部風險燈（只提醒）：7 項外部指標各自在過去3年最危險的 20% → 亮燈 ──
+#   2008–2026 兩段驗證方向一致；SPY 還在200日線上、≥4燈時，之後60日內跌≥10% 機率約 2～3 倍，但拿來減碼不會降低回撤，所以只提醒
+RISK_LIGHTS = [('投資級債轉弱', ('LQD', 'IEF'), -1), ('高收益債轉弱', ('HYG', 'IEF'), -1), ('非必需消費轉弱', ('XLY', 'XLP'), -1),
+               ('半導體轉弱', ('SMH', 'SPY'), -1), ('公用事業轉強', ('XLU', 'SPY'), 1), ('美元轉強', ('UUP', None), 1), ('銅金比轉弱', ('CPER', 'GLD'), -1)]
+RISK_LIGHT_SYMS = ('SPY', 'LQD', 'IEF', 'HYG', 'XLY', 'XLP', 'SMH', 'XLU', 'UUP', 'CPER', 'GLD')
+
+
+def risk_lights_calc(H):
+    """H={代號: [(date, close)...]} → dict(n=亮燈數, of=可算項數, on=[亮的名稱], spy200=SPY距200日線%, asof)"""
+    base = sorted(d for d, _ in H.get('SPY') or [])
+    if len(base) < 600:
+        return dict(err='SPY 歷史資料不足')
+    ser = {}
+    for k, rows in H.items():
+        m = dict(rows); last, out = None, []
+        for d in base:
+            last = m.get(d, last); out.append(last)
+        ser[k] = np.array([np.nan if v is None else v for v in out], dtype=float)
+    on, ok = [], 0
+    for nm, (a, b), sgn in RISK_LIGHTS:
+        if a not in ser or (b and b not in ser):
+            continue
+        r = ser[a] / ser[b] if b else ser[a]
+        ch = r[60:] / r[:-60] - 1
+        ch = ch[np.isfinite(ch)] * sgn
+        if len(ch) < 500:
+            continue
+        hist = ch[-757:-1]
+        ok += 1
+        if (hist < ch[-1]).mean() >= 0.8:
+            on.append(nm)
+    sp = ser['SPY']
+    return dict(n=len(on), of=ok, on=on, spy200=(sp[-1] / np.nanmean(sp[-200:]) - 1) * 100, asof=base[-1])
+
+
+def risk_lights_fetch(token):
+    H = {}
+    for sym in RISK_LIGHT_SYMS:
+        try:
+            H[sym] = [(r['date'], r['close']) for r in fetch_price(sym, token, 1400)]
+        except Exception:  # noqa
+            pass
+    return risk_lights_calc(H)
+
+
+def risk_lights_text(R):
+    if not R or R.get('err'):
+        return f"🚨 外部風險燈：無法計算（{(R or {}).get('err', '未取得')}）"
+    up = R['spy200'] > 0
+    warn = up and R['n'] >= 4
+    return (f"🚨 外部風險燈 **{R['n']}/{R['of']}**（{R['asof']}）" + (f"：{'、'.join(R['on'])}" if R['on'] else '') +
+            f"　｜　SPY 距200日線 {R['spy200']:+.1f}%　→　" +
+            ('⚠️ **多頭中亮≥4燈：之後60日急跌機率約 2～3 倍，先別加碼、別追高**（只提醒，照常換股）' if warn else
+             ('已跌破200日線：燈多半是跌勢本身造成，不再是提前預警；VIX>25 時歷史上之後報酬反而較好' if not up else '正常')))
 
 
 def render_market_pred(st, ss, K):
@@ -6809,7 +6867,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-23 大盤指標歷史下載'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-25 建議持股註明只限大盤部位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7407,6 +7465,12 @@ def render_batch(st, ss, K):
             ss['_mkt_regime'] = ('正常', f'SPY 抓取失敗（{str(_e)[:60]}），視為正常')
         ss['_mkt_regime_day'] = _rk
     _reg, _reginfo = ss.get('_mkt_regime', ('正常', ''))
+    if ss.get('_risk_lights_day') != _rk:   # 2026-11-23 外部風險燈（每天查一次，約11次API）
+        try:
+            ss['_risk_lights'] = risk_lights_fetch(ss.get('token', '').strip() or ss.get('api_key', '').strip())
+        except Exception as _e:  # noqa
+            ss['_risk_lights'] = dict(err=str(_e)[:60])
+        ss['_risk_lights_day'] = _rk
     _fp, _nac = factor_picks(df, regime=_reg)
     if _fp is not None and len(_fp):
         with st.expander(f'📅 每月因子選股（半年動能＋應計比率低，前 {len(_fp)} 檔、等比、每月換一次）', expanded=True):
@@ -7414,6 +7478,7 @@ def render_batch(st, ss, K):
                         + ('已套用 **F分數≥6** 門檻' if _fp.attrs.get('f_applied') else
                            ('急跌／V反彈期間 **暫停 F≥6 門檻**（崩盤後領漲的常是財報差的股票）' if _reg != '正常' else
                             '⚠️ 多數股票沒有 F 分數（沒勾「💎 財報品質」），**未套用 F≥6 門檻**')))
+            st.markdown(risk_lights_text(ss.get('_risk_lights')))
             st.caption('2026-11-20 新做法：台股 B方案那種追短線強勢股在美股無效（強勢股短線反而拉回），美股有效的是中期動能＋財報品質。'
                        '兩段樣本外驗證：20檔 年化約 30%（2017–19）／22%（2022–26），同股票池等權 14%／11%；最大回撤約 −21%／−37%（比大盤深）。'
                        '**每月換一次、20檔等比**（10檔回撤 −43% 太深；依排名加權只在一段有幫助；加 S／W 命中組合篩選兩段都變差）。'
