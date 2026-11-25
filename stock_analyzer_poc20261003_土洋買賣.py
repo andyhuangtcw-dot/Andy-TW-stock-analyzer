@@ -4015,12 +4015,108 @@ def market_verdict(mt, kp, pred):
     return '🧭 綜合判斷：價格與籌碼沒有極端訊號 → 正常部位'
 
 
+# ── 2026-11-25 🌐 美股外部風險燈（只提醒）：7 項美股外部指標各自在過去3年最危險的 20% → 亮燈；用 FMP，與美股版同一套 ──
+#   回測（2017–2026，美股前一晚收盤→台股隔天）：加權指數在200日線上、≥4燈時，台股之後60日內跌≥10% 機率
+#   2017–21 約 22%（0燈 9%）、2022–26 約 50%（0燈 21%）；樣本少（各約 40 天），只當提醒、不調整建議持股
+US_RISK_LIGHTS = [('投資級債轉弱', ('LQD', 'IEF'), -1), ('高收益債轉弱', ('HYG', 'IEF'), -1), ('非必需消費轉弱', ('XLY', 'XLP'), -1),
+                  ('半導體轉弱', ('SMH', 'SPY'), -1), ('公用事業轉強', ('XLU', 'SPY'), 1), ('美元轉強', ('UUP', None), 1), ('銅金比轉弱', ('CPER', 'GLD'), -1)]
+US_RISK_SYMS = ('SPY', 'LQD', 'IEF', 'HYG', 'XLY', 'XLP', 'SMH', 'XLU', 'UUP', 'CPER', 'GLD')
+
+
+def us_risk_calc(H):
+    """H={代號: [(date, close)...]} → dict(n, of, on, asof)"""
+    base = sorted(d for d, _ in H.get('SPY') or [])
+    if len(base) < 600:
+        return dict(err='SPY 歷史資料不足')
+    ser = {}
+    for k, rows in H.items():
+        m = dict(rows); last, out = None, []
+        for d in base:
+            last = m.get(d, last); out.append(last)
+        ser[k] = np.array([np.nan if v is None else v for v in out], dtype=float)
+    on, ok = [], 0
+    for nm, (a, b), sgn in US_RISK_LIGHTS:
+        if a not in ser or (b and b not in ser):
+            continue
+        r = ser[a] / ser[b] if b else ser[a]
+        ch = r[60:] / r[:-60] - 1
+        ch = ch[np.isfinite(ch)] * sgn
+        if len(ch) < 500:
+            continue
+        ok += 1
+        if (ch[-757:-1] < ch[-1]).mean() >= 0.8:
+            on.append(nm)
+    return dict(n=len(on), of=ok, on=on, asof=base[-1])
+
+
+def us_risk_fetch(fmp_key):
+    end = dt.date.today(); st_ = end - dt.timedelta(days=1400)
+    H, bad = {}, []
+    for sym in US_RISK_SYMS:
+        try:
+            r = requests.get('https://financialmodelingprep.com/stable/historical-price-eod/full',
+                             params={'symbol': sym, 'from': st_.isoformat(), 'to': end.isoformat(), 'apikey': fmp_key}, timeout=(10, 25))
+            j = r.json() if r.status_code == 200 else None
+            rows = j if isinstance(j, list) else (j or {}).get('historical') if isinstance(j, dict) else None
+            H[sym] = [(str(x['date'])[:10], float(x['close'])) for x in (rows or []) if x.get('close')]
+            if not H[sym]:
+                bad.append(sym)
+        except Exception:  # noqa
+            bad.append(sym)
+    R = us_risk_calc(H)
+    if bad and not R.get('err'):
+        R['bad'] = bad
+    return R
+
+
+def us_risk_state():
+    """每天抓一次（存在 session_state）；沒填 FMP Key 回 None"""
+    try:
+        import streamlit as st
+        ss = st.session_state
+    except Exception:  # noqa
+        return None
+    key = (ss.get('fmp_key') or '').strip()
+    if not key:
+        return None
+    day = dt.date.today().isoformat()
+    if ss.get('_us_risk_day') != (day, key[-4:]):
+        try:
+            ss['_us_risk'] = us_risk_fetch(key)
+        except Exception as ex:  # noqa
+            ss['_us_risk'] = dict(err=str(ex)[:60])
+        ss['_us_risk_day'] = (day, key[-4:])
+    return ss.get('_us_risk')
+
+
+def us_risk_lines(pred=None):
+    R = us_risk_state()
+    if R is None:
+        return ['・🌐 美股外部風險燈：側欄填「FMP API Key（選填）」才會顯示（每天約 11 次 FMP API）']
+    if R.get('err'):
+        return [f"・🌐 美股外部風險燈：無法計算（{R['err']}）"]
+    b200 = None
+    for d in ((pred or {}).get('det') or []):
+        if d.get('name') == '偏離200日均線%' and d.get('val') is not None:
+            b200 = d['val']
+    up = b200 is None or b200 > 0
+    if up and R['n'] >= 4:
+        v = '⚠️ **加權在200日線上、美股亮≥4燈：歷史上台股之後60日急跌機率約 2.5 倍 → 先別加碼、別追高**（只提醒，不調整建議持股）'
+    elif not up:
+        v = '加權已跌破200日線：燈多半反映跌勢本身，不再是提前預警'
+    else:
+        v = '正常'
+    return [f"・🌐 **美股外部風險燈 {R['n']}/{R['of']}**（美股 {R['asof']}）" + (f"：{'、'.join(R['on'])}" if R['on'] else '')
+            + (f"　加權距200日線 {b200:+.1f}%" if b200 is not None else '') + f"　→ {v}"
+            + (f"（抓不到：{'、'.join(R['bad'])}）" if R.get('bad') else '')]
+
+
 def market_guide_lines(mt, kp, pred=None):
     """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）；
     大盤預測評分卡樣本外驗證有效時，建議持股改用評分卡"""
     out = []
     ps = market_position(mt, kp)
-    _heat = heat_light_lines(pred) + dd_risk_lines(pred)
+    _heat = heat_light_lines(pred) + dd_risk_lines(pred) + us_risk_lines(pred)
     _vd = market_verdict(mt, kp, pred)
     if _vd:
         out.append(_vd)
@@ -6579,7 +6675,7 @@ def parse_stocks(txt):
     return [s.strip() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-20 大盤5日跌>5%不買新股'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-25 美股外部風險燈'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -6767,6 +6863,7 @@ def main():
 
         st.divider()
         st.text_input('OpenAI API Key（選填）', type='password', key='openai_key')
+        st.text_input('FMP API Key（選填，🌐 美股外部風險燈用）', type='password', key='fmp_key')
         st.selectbox('AI 模型', ['gpt-4o-mini', 'gpt-4o'], key='openai_model')
         st.caption('評分：🟢80+ 積極做多　🔵65-79 可考慮　🟡50-64 觀望　🔴<50 不適合')
 
