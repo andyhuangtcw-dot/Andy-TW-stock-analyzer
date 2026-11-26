@@ -5475,7 +5475,7 @@ def rocket_flag(row, b):
 MKT_PAUSE_DAYS = 120   # 2026-11-23 急跌後暫停 F≥6 門檻的天數
 
 
-def market_regime(closes, dates):
+def spy_regime(closes, dates):
     """2026-11-22 大盤狀態（用 SPY 收盤）：
     急跌＝收盤比60日高點低≥15% 而且 比30日高點低≥10%（跌得又深又快）；
     急跌後＝最近一次急跌在120天內（2026-11-23 改：原本「90天內且反彈≥10%」在 2020 下半年太早恢復 F 門檻，14組樣本 改成120天 回撤勝 11→12/14）；其餘＝正常。
@@ -6867,7 +6867,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-25 建議持股註明只限大盤部位'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-26 修正大盤狀態函式撞名'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -7460,7 +7460,7 @@ def render_batch(st, ss, K):
     if ss.get('_mkt_regime_day') != _rk:
         try:
             _bm = fetch_price(BENCHMARK_ID, ss.get('token', '').strip() or ss.get('api_key', '').strip(), 200)
-            ss['_mkt_regime'] = market_regime([x['close'] for x in _bm], [x['date'] for x in _bm])
+            ss['_mkt_regime'] = spy_regime([x['close'] for x in _bm], [x['date'] for x in _bm])
         except Exception as _e:  # noqa
             ss['_mkt_regime'] = ('正常', f'SPY 抓取失敗（{str(_e)[:60]}），視為正常')
         ss['_mkt_regime_day'] = _rk
